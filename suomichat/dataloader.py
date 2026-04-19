@@ -16,24 +16,50 @@ Fallback to the original if you have very limited data AND long documents:
 https://github.com/karpathy/suomichat/blob/3c3a3d7/suomichat/dataloader.py#L78-L117
 """
 
+import os
 import torch
 import pyarrow.parquet as pq
 
-from suomichat.common import get_dist_info
+from suomichat.common import get_dist_info, get_base_dir
 from suomichat.dataset import list_parquet_files
+
+def _detect_tokenized_dir():
+    """Check if pre-tokenized shards exist. Returns (data_dir, is_pretokenized)."""
+    base_dir = get_base_dir()
+    tok_dir = os.path.join(base_dir, "base_data_tokenized")
+    if os.path.isdir(tok_dir):
+        files = [f for f in os.listdir(tok_dir) if f.endswith(".parquet")]
+        if files:
+            return tok_dir, True
+    return None, False
+
 
 def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     """
-    Infinite iterator over document batches (list of text strings) from parquet files.
+    Infinite iterator over document batches from parquet files.
 
-    Handles DDP sharding and approximate resume. Each yield is (text_batch, (pq_idx, rg_idx, epoch))
-    where text_batch is a list of document strings, indices track position for resumption,
-    and epoch counts how many times we've cycled through the dataset (starts at 1).
+    Auto-detects pre-tokenized shards (base_data_tokenized/) and yields
+    token lists directly, skipping on-the-fly tokenization. Falls back to
+    raw text shards (base_data_climbmix/) if no tokenized data exists.
+
+    Yields: (batch, (pq_idx, rg_idx, epoch), is_pretokenized)
+      - batch: list of strings (raw) or list of token-lists (pre-tokenized)
     """
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
-    warn_on_legacy = ddp_rank == 0 and split == "train" # rank 0 on train split will warn on legacy
-    parquet_paths = list_parquet_files(warn_on_legacy=warn_on_legacy)
+    tok_dir, is_pretokenized = _detect_tokenized_dir()
+    if is_pretokenized:
+        parquet_paths = sorted(
+            os.path.join(tok_dir, f) for f in os.listdir(tok_dir)
+            if f.endswith(".parquet") and not f.endswith(".tmp"))
+        if ddp_rank == 0:
+            print(f"Using pre-tokenized data ({len(parquet_paths)} shards)")
+        col_name = "tokens"
+    else:
+        warn_on_legacy = ddp_rank == 0 and split == "train"
+        parquet_paths = list_parquet_files(warn_on_legacy=warn_on_legacy)
+        col_name = "text"
+
     assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
 
@@ -62,9 +88,9 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
                 rg_idx = ddp_rank
             while rg_idx < pf.num_row_groups:
                 rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
+                batch = rg.column(col_name).to_pylist()
                 for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch)
+                    yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch), is_pretokenized
                 rg_idx += ddp_world_size
             pq_idx += 1
         first_pass = False
@@ -103,10 +129,15 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 
     def refill_buffer():
         nonlocal pq_idx, rg_idx, epoch
-        doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
-        for tokens in token_lists:
-            doc_buffer.append(tokens)
+        doc_batch, (pq_idx, rg_idx, epoch), is_pretokenized = next(batches)
+        if is_pretokenized:
+            # Data is already tokenized with BOS — use directly
+            for tokens in doc_batch:
+                doc_buffer.append(tokens)
+        else:
+            token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
+            for tokens in token_lists:
+                doc_buffer.append(tokens)
 
     # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
     # This gives us contiguous views and a single HtoD transfer

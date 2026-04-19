@@ -162,30 +162,38 @@ for group in optimizer.param_groups:
 
 # SFT data mixture and DataLoader
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
-_sft_mixture = os.environ.get("SUOMICHAT_SFT_MIXTURE", "fi").lower()
-if _sft_mixture == "en":
-    train_tasks = [
-        SmolTalk(split="train"),
-        CustomJSON(filepath=identity_conversations_filepath),
-        CustomJSON(filepath=identity_conversations_filepath),
-        *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)],
-        *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)],
-        SimpleSpelling(size=200000, split="train"),
-        SpellingBee(size=80000, split="train"),
-    ]
-    print0("Using English SFT mixture (SUOMICHAT_SFT_MIXTURE=en)")
+# Check for combined SFT file first (suomichat_sft_v1.train.jsonl)
+sft_file = os.path.join(base_dir, "suomichat_sft_v1.train.jsonl")
+if os.path.exists(sft_file):
+    train_tasks = [CustomJSON(filepath=sft_file)]
+    print0(f"Using combined Finnish SFT file: {sft_file}")
 else:
-    from tasks.poro2_fi import FinnishAlpaca
-    train_tasks = [
-        FinnishAlpaca(split="train"),
-        CustomJSON(filepath=identity_conversations_filepath),
-        CustomJSON(filepath=identity_conversations_filepath),
-        CustomJSON(filepath=identity_conversations_filepath),
-    ]
-    print0("Using Finnish SFT mixture (default)")
+    _sft_mixture = os.environ.get("SUOMICHAT_SFT_MIXTURE", "fi").lower()
+    if _sft_mixture == "en":
+        train_tasks = [
+            SmolTalk(split="train"),
+            CustomJSON(filepath=identity_conversations_filepath),
+            CustomJSON(filepath=identity_conversations_filepath),
+            *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)],
+            *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)],
+            SimpleSpelling(size=200000, split="train"),
+            SpellingBee(size=80000, split="train"),
+        ]
+        print0("Using English SFT mixture (SUOMICHAT_SFT_MIXTURE=en)")
+    else:
+        from tasks.poro2_fi import FinnishAlpaca
+        train_tasks = [
+            FinnishAlpaca(split="train"),
+            CustomJSON(filepath=identity_conversations_filepath),
+            CustomJSON(filepath=identity_conversations_filepath),
+            CustomJSON(filepath=identity_conversations_filepath),
+        ]
+        print0("Using Finnish SFT (FinnishAlpaca fallback)")
 train_dataset = TaskMixture(train_tasks)
 print0(f"Training mixture: {len(train_dataset):,} rows")
-if _sft_mixture == "en":
+if os.path.exists(sft_file):
+    val_dataset = TaskMixture([CustomJSON(filepath=sft_file, start=0, stop=500)])
+elif _sft_mixture == "en":
     val_dataset = TaskMixture([
         SmolTalk(split="test"),
         MMLU(subset="all", split="test", stop=5200),
