@@ -141,10 +141,11 @@ Lessons learned from the first training runs (d12, d20, d24). These should guide
 - `scripts/tokenize_shards.py` — Pre-tokenization.
 
 ### TODO for Next Iteration
-- [ ] Remove English CORE/ChatCORE from `base_train.py` and `chat_sft.py`
-- [ ] Wire FIN-bench directly into training loop (replace CORE eval)
-- [ ] Add `--skip-eval` flag for faster training iteration
+- [x] Remove English CORE/ChatCORE from `base_train.py` and `chat_sft.py` (Phase 1)
+- [x] Wire FIN-bench directly into training loop (replace CORE eval) (Phase 2)
+- [x] Add `--skip-finbench` flag for faster training iteration (Phase 2)
 - [ ] Fix Modal output streaming (use `modal deploy` or webhooks)
 - [ ] Add repetition penalty to inference (`chat_cli.py`, `chat_web.py`)
 - [ ] Support checkpoint resume after Modal preemption
-- [ ] Add Finnish RL (chat_rl.py) with Finnish math/reasoning rewards
+- [ ] Finnish-RL on Finnish math/reasoning rewards (chat_rl.py was deleted in
+      Phase 1; would need a fresh Finnish-flavored implementation)

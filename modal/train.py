@@ -6,9 +6,10 @@ Setup (once):
     modal setup
     # Upload data (done separately via modal volume put)
 
-Train:
-    python modal/train.py train                        # 1x H100, d12, ~2.5h, ~$8
-    python modal/train.py train --depth 26 --gpus 8    # 8x H100, d26, ~3h, ~$76
+Train (single dial: --depth; GPU count auto-picked from depth, override with --gpus):
+    python modal/train.py train --depth 12             # 1x H100 (depth<22 default)
+    python modal/train.py train --depth 24             # 8x H100 (depth>=22 default)
+    python modal/train.py train --depth 20 --gpus 1    # force single GPU
 
 Download results:
     python modal/train.py download
@@ -39,7 +40,7 @@ SUOMICHAT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 image = (
     modal.Image.debian_slim(python_version="3.10")
-    .apt_install("curl", "build-essential")
+    .apt_install("curl", "build-essential", "git")
     .pip_install(
         "torch==2.9.1",
         "datasets>=4.0.0",
@@ -52,6 +53,9 @@ image = (
         "uvicorn",
         "psutil",
         "kernels",
+        # End-of-training FIN-bench eval. Pin matches pyproject.toml's
+        # `eval` extra so local and Modal runs use the same harness.
+        "lm_eval @ git+https://github.com/LumiOpen/lm-evaluation-harness.git@6e0a60abb74cf098bc5511b25caf66566586f9f0",
     )
     .env({
         "SUOMICHAT_BASE_DIR": DATA_PATH,
@@ -108,15 +112,23 @@ def _setup_dirs():
     return n
 
 
+def _resolve_config(depth, nproc):
+    """Resolve the training config inside the Modal container by calling
+    suomichat.hardware.recommend_config — this picks bs and fp8 from the
+    container's actual VRAM detection, not a hardcoded table here."""
+    sys.path.insert(0, "/app/suomichat")
+    from suomichat.hardware import detect_hardware, recommend_config
+    hw = detect_hardware()
+    cfg = recommend_config(depth, hw=hw)
+    # nproc is fixed by the @app.function decoration, not autoconfig
+    cfg["nproc"] = nproc
+    return cfg
+
+
 def _train_cmd(depth, ratio, nproc=1):
-    """Build pretrain command."""
-    use_fp8 = depth >= 24
-    # Batch size must make (bs × seq × nproc) divide total_batch_size evenly.
-    # With seq=1024 and 8 GPUs: bs must be power-of-2 (16, 32, 64).
-    # Start conservative, check VRAM, increase if headroom exists.
-    # Match nanochat speedrun config: bs=16, seq=2048 (default), fp8 for d24+
-    use_fp8 = depth >= 24
-    bs = 16  # nanochat speedrun uses bs=16 on 8xH100
+    """Build pretrain command using hardware-derived bs and fp8."""
+    cfg = _resolve_config(depth, nproc)
+    print(f"  config: bs={cfg['device_batch_size']} fp8={cfg['fp8']} max_seq={cfg['max_seq_len']} ratio={ratio}", flush=True)
 
     if nproc > 1:
         prefix = ["torchrun", "--standalone", f"--nproc_per_node={nproc}", "-m", "scripts.base_train", "--"]
@@ -125,29 +137,29 @@ def _train_cmd(depth, ratio, nproc=1):
 
     cmd = prefix + [
         f"--depth={depth}",
-        f"--device-batch-size={bs}",
+        f"--device-batch-size={cfg['device_batch_size']}",
         f"--target-param-data-ratio={ratio}",
+        f"--max-seq-len={cfg['max_seq_len']}",
         "--run=dummy",
-        "--core-metric-every=999999",
         "--sample-every=-1",
         "--save-every=-1",
     ]
-    # seq=2048 is the default — don't override (we were using 1024 before)
-    if use_fp8:
+    if cfg["fp8"]:
         cmd.append("--fp8")
     return cmd
 
 
-def _sft_cmd(nproc=1):
-    """Build SFT command."""
+def _sft_cmd(depth, nproc=1):
+    """Build SFT command, also using hardware-derived bs."""
+    cfg = _resolve_config(depth, nproc)
     if nproc > 1:
         prefix = ["torchrun", "--standalone", f"--nproc_per_node={nproc}", "-m", "scripts.chat_sft", "--"]
     else:
         prefix = [sys.executable, "-m", "scripts.chat_sft"]
 
     return prefix + [
-        "--device-batch-size=16",
-        "--max-seq-len=2048",
+        f"--device-batch-size={cfg['device_batch_size']}",
+        f"--max-seq-len={cfg['max_seq_len']}",
         "--load-optimizer=0",
         "--run=dummy",
     ]
@@ -161,11 +173,12 @@ def _sft_cmd(nproc=1):
     cpu=4,
     memory=8192,
 )
-def sft_only():
-    """Run SFT only on existing pretrained checkpoint (1x H100)."""
+def sft_only(depth: int = 12):
+    """Run SFT only on existing pretrained checkpoint (1x H100). Pass --depth
+    so hardware autoconfig knows what batch size to use."""
     _setup_dirs()
-    print(">>> Finnish SFT (346K rows)...", flush=True)
-    rc = subprocess.call(_sft_cmd(nproc=1))
+    print(">>> Finnish SFT...", flush=True)
+    rc = subprocess.call(_sft_cmd(depth, nproc=1))
     if rc != 0:
         raise RuntimeError(f"SFT failed with exit code {rc}")
     checkpoint_vol.commit()
@@ -193,7 +206,7 @@ def train_single(depth: int = 12, ratio: int = 8):
     checkpoint_vol.commit()
 
     print(">>> Finnish SFT...", flush=True)
-    subprocess.run(_sft_cmd(nproc=1), check=True)
+    subprocess.run(_sft_cmd(depth, nproc=1), check=True)
     checkpoint_vol.commit()
     data_vol.commit()
     print(">>> Done!")
@@ -221,12 +234,18 @@ def train_multi(depth: int = 20, ratio: int = 8):
     checkpoint_vol.commit()
 
     print(">>> Finnish SFT on 8x H100...", flush=True)
-    rc = subprocess.call(_sft_cmd(nproc=8))
+    rc = subprocess.call(_sft_cmd(depth, nproc=8))
     if rc != 0:
         raise RuntimeError(f"SFT failed with exit code {rc}")
     checkpoint_vol.commit()
     data_vol.commit()
     print(">>> Done!")
+
+
+def _default_gpus_for_depth(depth):
+    """Single H100 fits up to ~d20; deeper models want 8 H100s for speed
+    (and d24+ benefits a lot from FP8 + extra VRAM headroom)."""
+    return 8 if depth >= 22 else 1
 
 
 # --- CLI ---
@@ -238,9 +257,13 @@ def cli():
     tr = sub.add_parser("train", help="Train on Modal")
     tr.add_argument("--depth", type=int, default=12)
     tr.add_argument("--ratio", type=int, default=8)
-    tr.add_argument("--gpus", type=int, default=1, choices=[1, 8])
+    tr.add_argument("--gpus", type=int, default=None, choices=[1, 8],
+                    help="GPU count (default: 1 for d<22, 8 for d>=22)")
 
-    sub.add_parser("sft", help="Run SFT only on existing checkpoint (1x H100)")
+    s = sub.add_parser("sft", help="Run SFT only on existing checkpoint (1x H100)")
+    s.add_argument("--depth", type=int, default=12,
+                   help="model depth (used for batch-size autoconfig)")
+
     sub.add_parser("diagnose", help="Run diagnostics on Modal container")
     sub.add_parser("download", help="Download checkpoints from Modal")
 
@@ -248,7 +271,7 @@ def cli():
 
     if args.command == "sft":
         with app.run():
-            sft_only.remote()
+            sft_only.remote(depth=args.depth)
 
     elif args.command == "diagnose":
         with app.run():
@@ -256,8 +279,10 @@ def cli():
             print(result)
 
     elif args.command == "train":
+        gpus = args.gpus if args.gpus else _default_gpus_for_depth(args.depth)
+        print(f"Dispatching to {gpus}× H100 for depth={args.depth}")
         with app.run():
-            if args.gpus == 1:
+            if gpus == 1:
                 train_single.remote(depth=args.depth, ratio=args.ratio)
             else:
                 train_multi.remote(depth=args.depth, ratio=args.ratio)

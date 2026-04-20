@@ -59,6 +59,12 @@ cpu = [
 gpu = [
     "torch==2.9.1",
 ]
+# FIN-bench evaluation. Install with `uv sync --extra gpu --extra eval`.
+# Pinned to a commit so reruns are reproducible; bump as the LumiOpen fork
+# evolves and Finnish task definitions change.
+eval = [
+    "lm_eval @ git+https://github.com/LumiOpen/lm-evaluation-harness.git@6e0a60abb74cf098bc5511b25caf66566586f9f0",
+]
 
 [tool.uv]
 default-groups = []

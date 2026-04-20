@@ -21,14 +21,11 @@ class CustomJSON(Task):
 
         # Load all conversations from the JSONL file
         if not os.path.exists(filepath):
-            # Helpful error message due to recent change. Will be removed in the future.
             print("-" * 80)
-            print(f"Warning: File {filepath} does not exist")
-            print("HINT (Oct 21 2025)")
-            print("If you recently did a git pull and suddenly see this, it might be due to the new addition of identity conversations")
-            print("See this discussion for more details: https://github.com/karpathy/suomichat/discussions/139")
-            print("Quick fix: simply run the following command to download the file and you're done:")
-            print(f"curl -L -o {filepath} https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl")
+            print(f"Warning: SFT file not found at {filepath}")
+            print("If this is the identity_conversations.jsonl file, generate it with:")
+            print("    python scripts/gen_identity.py")
+            print(f"Otherwise, point --sft-file at your jsonl, or place it at {filepath}.")
             print("-" * 80)
 
         else:
@@ -41,13 +38,19 @@ class CustomJSON(Task):
                     # Validate the conversation structure
                     assert isinstance(messages, list), f"Expected list of messages, got {type(messages)}"
                     assert len(messages) >= 2, f"Conversation must have at least 2 messages, got {len(messages)}"
-                    # Validate message structure and alternating roles
+                    # An optional system message at position 0 is accepted; the
+                    # tokenizer.render_conversation merges it into the first
+                    # user message. After it, roles must alternate user/assistant.
+                    has_system = messages[0].get("role") == "system"
+                    user_offset = 1 if has_system else 0
                     for i, message in enumerate(messages):
                         assert "role" in message, f"Message {i} missing 'role' field"
                         assert "content" in message, f"Message {i} missing 'content' field"
-                        expected_role = "user" if i % 2 == 0 else "assistant"
-                        assert message["role"] == expected_role, f"Message {i} has role {message['role']} but should be {expected_role}"
                         assert isinstance(message["content"], str), f"Message {i} content must be a string"
+                        if i == 0 and has_system:
+                            continue
+                        expected_role = "user" if (i - user_offset) % 2 == 0 else "assistant"
+                        assert message["role"] == expected_role, f"Message {i} has role {message['role']} but should be {expected_role}"
 
                     self.conversations.append(messages)
 

@@ -6,6 +6,7 @@ Secondary (optional): `LumiOpen/poro2-instruction-collection` filtered to Finnis
 (skipped if unavailable or schema differs; gracefully degrades).
 """
 
+import torch.distributed as dist
 from datasets import load_dataset
 from tasks.common import Task
 
@@ -20,6 +21,29 @@ def _finnish_ratio(text: str) -> float:
     return fi / len(chars)
 
 
+def _load_dataset_rank0_gated(*args, **kwargs):
+    """Rank 0 triggers the HF download; other ranks wait on a barrier
+    and then read from the shared cache.
+
+    Without this, 8 ranks on 8-GPU runs race to download the same dataset
+    in parallel — 8× HF API traffic + potential FileLock contention in
+    HF's download code. With the gate, only rank 0 hits the network on
+    cold cache; the others get instant-cache hits after the barrier.
+
+    On single-GPU runs (DDP not initialized), this is just load_dataset.
+    """
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+        if rank == 0:
+            result = load_dataset(*args, **kwargs)
+            dist.barrier()
+            return result
+        else:
+            dist.barrier()
+            return load_dataset(*args, **kwargs)
+    return load_dataset(*args, **kwargs)
+
+
 class FinnishAlpaca(Task):
     """
     datacrunch/finnish_alpaca — Alpaca-style Finnish instruction dataset.
@@ -27,7 +51,9 @@ class FinnishAlpaca(Task):
     """
     def __init__(self, split="train", **kwargs):
         super().__init__(**kwargs)
-        self.ds = load_dataset("datacrunch/finnish_alpaca", split=split).shuffle(seed=42)
+        self.ds = _load_dataset_rank0_gated(
+            "datacrunch/finnish_alpaca", split=split,
+        ).shuffle(seed=42)
         self.length = len(self.ds)
 
     def num_examples(self):
@@ -56,8 +82,9 @@ class Poro2InstructFi(Task):
     """
     def __init__(self, split="train", **kwargs):
         super().__init__(**kwargs)
-        self.ds = load_dataset("LumiOpen/poro2-instruction-collection",
-                               split=split).shuffle(seed=42)
+        self.ds = _load_dataset_rank0_gated(
+            "LumiOpen/poro2-instruction-collection", split=split,
+        ).shuffle(seed=42)
         # Pre-filter indices to Finnish-looking rows (one pass, cheap-ish)
         self.indices = []
         for i, row in enumerate(self.ds):

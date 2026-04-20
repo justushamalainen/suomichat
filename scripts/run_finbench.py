@@ -3,34 +3,23 @@
 Run FIN-bench-v2 evaluation on a suomichat checkpoint using lm-evaluation-harness.
 
 Usage:
-    cd /home/janitor/llm-training/suomichat
+    cd /path/to/suomichat
     source .venv/bin/activate
-    export SUOMICHAT_BASE_DIR=/home/janitor/llm-training/data-fi
-    python /home/janitor/llm-training/run_finbench.py [--source sft] [--limit 0] [--tasks TASK1,TASK2]
+    python -m scripts.run_finbench [--source sft] [--limit 0] [--tasks TASK1,TASK2]
 """
 import sys
 import os
 import argparse
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, os.path.dirname(__file__))
 
-# Register suomichat model BEFORE importing lm_eval evaluator
-import lm_eval_wrapper  # noqa: F401 — registers @register_model("suomichat")
+# Importing the wrapper has side effects: it registers @register_model("suomichat")
+# AND exports FINNISH_CORE_TASKS — both must come from the same place to keep the
+# default task list consistent between this CLI and the in-process call.
+from scripts.lm_eval_wrapper import FINNISH_CORE_TASKS  # noqa: F401
 
-import lm_eval
 from lm_eval.evaluator import simple_evaluate
 from lm_eval.utils import make_table
-
-FINNISH_CORE_TASKS = [
-    "goldenswag_ht_fi_cf_fbv2_p0",
-    "scandisent_fi_cf_fbv2_p0",
-    "sib200_fi_cf_fbv2_p0",
-    "belebele_fin_cf_fbv2_p0",
-    "FIN-bench_general_knowledge_multiple_choice",
-    "FIN-bench_analogies_multiple_choice",
-    "FIN-bench_cause_and_effect_multiple_choice",
-]
 
 
 def main():
@@ -60,7 +49,6 @@ def main():
     print(make_table(results))
     print("=" * 80)
 
-    # Print summary
     if "results" in results:
         scores = []
         for task, metrics in results["results"].items():

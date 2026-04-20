@@ -131,17 +131,3 @@ def render_mc(question, letters, choices):
     return query
 
 
-if __name__ == "__main__":
-    # very lightweight test of slicing
-    from tasks.mmlu import MMLU
-
-    ds = MMLU(subset="all", split="auxiliary_train")
-    print("Length of MMLU: ", len(ds))
-    ex = ds[5]
-    print("5th example: ", ex)
-
-    ds = MMLU(subset="all", split="auxiliary_train", start=5, stop=10)
-    print("Length of sliced MMLU[5:10]: ", len(ds))
-    print("0th example of sliced MMLU: ", ds[0])
-
-    print("They match: ", ex == ds[0])

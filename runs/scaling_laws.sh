@@ -24,7 +24,7 @@ RESULTS_FILE="$RESULTS_DIR/results.csv"
 
 # Write CSV header only if file doesn't exist
 if [ ! -f "$RESULTS_FILE" ]; then
-    echo "flops_budget,depth,model_dim,params_wte,params_value_embeds,params_lm_head,params_transformer,params_scalars,params_total,num_iterations,tokens_trained,val_bpb,core_score,train_time_sec" > "$RESULTS_FILE"
+    echo "flops_budget,depth,model_dim,params_wte,params_value_embeds,params_lm_head,params_transformer,params_scalars,params_total,num_iterations,tokens_trained,val_bpb,train_time_sec" > "$RESULTS_FILE"
 fi
 
 log() {
@@ -74,7 +74,6 @@ for flops in "${FLOPS_BUDGETS[@]}"; do
 
         # Train the model with fixed flops budget
         # The script will auto-calculate num_iterations to hit target_flops
-        # CORE eval happens once at the end (999999 ensures only final step)
         torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- \
             --depth=$d \
             --target-flops=$flops \
@@ -82,8 +81,6 @@ for flops in "${FLOPS_BUDGETS[@]}"; do
             --run="${WANDB_RUN}_${TAG}" \
             --model-tag="${TAG}" \
             --eval-tokens=$EVAL_TOKENS \
-            --core-metric-every=999999 \
-            --core-metric-max-per-task=-1 \
             --sample-every=-1 \
             --save-every=-1 \
             $DEVICE_BATCH_SIZE_ARG \
@@ -114,17 +111,10 @@ for flops in "${FLOPS_BUDGETS[@]}"; do
         # Val BPB from final eval
         VAL_BPB=$(grep "Validation bpb:" "$LOG_FILE" | tail -1 | grep -oP '[\d.]+$')
 
-        # Extract CORE score from training log (evaluated on final step)
-        CORE_SCORE=$(grep "CORE metric:" "$LOG_FILE" | tail -1 | awk '{print $NF}')
-        if [ -z "$CORE_SCORE" ]; then
-            log "WARNING: Could not extract CORE score for d=$d"
-            CORE_SCORE="0.0"
-        fi
-
-        log "  Params: $PARAMS_TOTAL (transformer: $PARAMS_TRANSFORMER), Iters: $NUM_ITERS, Val BPB: $VAL_BPB, CORE: $CORE_SCORE"
+        log "  Params: $PARAMS_TOTAL (transformer: $PARAMS_TRANSFORMER), Iters: $NUM_ITERS, Val BPB: $VAL_BPB"
 
         # Append to CSV
-        echo "$flops,$d,$MODEL_DIM,$PARAMS_WTE,$PARAMS_VE,$PARAMS_LM,$PARAMS_TRANSFORMER,$PARAMS_SCALARS,$PARAMS_TOTAL,$NUM_ITERS,$TOKENS_TRAINED,$VAL_BPB,$CORE_SCORE,$TRAIN_TIME" >> "$RESULTS_FILE"
+        echo "$flops,$d,$MODEL_DIM,$PARAMS_WTE,$PARAMS_VE,$PARAMS_LM,$PARAMS_TRANSFORMER,$PARAMS_SCALARS,$PARAMS_TOTAL,$NUM_ITERS,$TOKENS_TRAINED,$VAL_BPB,$TRAIN_TIME" >> "$RESULTS_FILE"
     done
 done
 

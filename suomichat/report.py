@@ -204,20 +204,15 @@ def slugify(text):
     """Slugify a text string."""
     return text.lower().replace(" ", "-")
 
-# the expected files and their order
+# Sections written by the training pipeline, in render order.
+# Slugs are produced by `slugify(section_name)` from the `.log()` calls in
+# scripts/{tok_train,tok_eval,base_train,chat_sft}.py.
 EXPECTED_FILES = [
     "tokenizer-training.md",
     "tokenizer-evaluation.md",
     "base-model-training.md",
-    "base-model-loss.md",
-    "base-model-evaluation.md",
-    "chat-sft.md",
-    "chat-evaluation-sft.md",
-    "chat-rl.md",
-    "chat-evaluation-rl.md",
+    "sft.md",
 ]
-# the metrics we're currently interested in
-chat_metrics = ["ARC-Easy", "ARC-Challenge", "MMLU", "GSM8K", "HumanEval", "ChatCORE"]
 
 def extract(section, keys):
     """simple def to extract a single key from a section"""
@@ -307,17 +302,14 @@ class Report:
                     continue
                 with open(section_file, "r", encoding="utf-8") as in_file:
                     section = in_file.read()
-                # Extract timestamp from this section (the last section's timestamp will "stick" as end_time)
-                if "rl" not in file_name:
-                    # Skip RL sections for end_time calculation because RL is experimental
-                    end_time = extract_timestamp(section, "timestamp:")
-                # extract the most important metrics from the sections
-                if file_name == "base-model-evaluation.md":
-                    final_metrics["base"] = extract(section, "CORE")
-                if file_name == "chat-evaluation-sft.md":
-                    final_metrics["sft"] = extract(section, chat_metrics)
-                if file_name == "chat-evaluation-rl.md":
-                    final_metrics["rl"] = extract(section, "GSM8K") # RL only evals GSM8K
+                end_time = extract_timestamp(section, "timestamp:")
+                # Surface the two useful summary numbers: validation bpb (loss
+                # quality, always present) and FIN-CORE (chat quality composite,
+                # present when FIN-bench was not skipped).
+                if file_name == "base-model-training.md":
+                    final_metrics["base"] = extract(section, ["Minimum validation bpb", "FIN-CORE"])
+                if file_name == "sft.md":
+                    final_metrics["sft"] = extract(section, ["Minimum validation bpb", "FIN-CORE"])
                 # append this section of the report
                 out_file.write(section)
                 out_file.write("\n")
@@ -327,14 +319,10 @@ class Report:
             out_file.write(bloat_data)
             out_file.write("\n\n")
             # Collect all unique metric names
-            all_metrics = set()
-            for stage_metrics in final_metrics.values():
-                all_metrics.update(stage_metrics.keys())
-            # Custom ordering: CORE first, ChatCORE last, rest in middle
-            all_metrics = sorted(all_metrics, key=lambda x: (x != "CORE", x == "ChatCORE", x))
+            all_metrics = sorted({k for sm in final_metrics.values() for k in sm})
             # Fixed column widths
-            stages = ["base", "sft", "rl"]
-            metric_width = 15
+            stages = ["base", "sft"]
+            metric_width = 25
             value_width = 8
             # Write table header
             header = f"| {'Metric'.ljust(metric_width)} |"

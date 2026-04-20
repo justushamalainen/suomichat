@@ -1,15 +1,15 @@
 #!/usr/bin/env python
 """
 Generate Finnish identity_conversations.jsonl for SuomiChat.
-Writes to $SUOMICHAT_BASE_DIR/identity_conversations.jsonl.
+Writes to $SUOMICHAT_BASE_DIR/identity_conversations.jsonl (default ~/.cache/suomichat).
 Hand-curated + mechanically varied — roughly 120 conversations.
 """
 import json
 import os
 
-OUT = os.path.join(
-    os.environ.get("SUOMICHAT_BASE_DIR", "/home/janitor/llm-training/data-fi"),
-    "identity_conversations.jsonl")
+from suomichat.common import get_base_dir
+
+OUT = os.path.join(get_base_dir(), "identity_conversations.jsonl")
 
 NAME_QS = [
     "Kuka sinä olet?",

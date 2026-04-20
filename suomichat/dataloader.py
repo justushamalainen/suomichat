@@ -12,8 +12,9 @@ BOS-aligned loses ~35% of tokens to cropping, but ensures that
 there are fewer "confusing" tokens in the train/val batches as every token can
 now attend back to the BOS token and sees the full context of the document.
 
-Fallback to the original if you have very limited data AND long documents:
-https://github.com/karpathy/suomichat/blob/3c3a3d7/suomichat/dataloader.py#L78-L117
+Fallback to the original (non-BOS-aligned) loader if you have very limited
+data AND long documents — see suomichat dataloader history for the simpler
+version that crops mid-document instead of skipping to the next BOS.
 """
 
 import os

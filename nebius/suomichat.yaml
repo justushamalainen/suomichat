@@ -1,0 +1,141 @@
+# SuomiChat training on Nebius via SkyPilot.
+#
+# Launch:
+#   pip install "skypilot-nightly[nebius]"
+#   sky launch -c suomichat suomichat.yaml --env DEPTH=24
+#
+# Re-run on the same cluster (setup cached):
+#   sky exec suomichat suomichat.yaml --env DEPTH=26
+#
+# Tear down:
+#   sky down suomichat
+#
+# Autostop on idle (~$0 after 30 min of inactivity):
+#   sky autostop suomichat -i 30
+
+resources:
+  cloud: nebius
+  accelerators: H100:8     # 1-8 GPUs supported; hardware.py autoconfig picks bs/FP8
+  region: eu-north1        # matches Finnish data residency
+  disk_size: 500           # GB; d24 Chinchilla needs ~120 GB for raw+tokenized
+
+# 1-node for 8× H100. For multi-node (rare at d24/d26), see num_nodes below.
+# num_nodes: 2
+
+# File mounts — point at your Nebius Object Storage buckets.
+# The buckets persist across cluster teardown/relaunch, so pre-tokenized
+# data survives. Comment these out for a cold-cache run that prepares
+# data from HF.
+file_mounts:
+  /workspace/data:
+    source: nebius://suomichat-data         # rename to your bucket
+    mode: MOUNT                              # read+write
+  /workspace/checkpoints:
+    source: nebius://suomichat-checkpoints
+    mode: MOUNT
+
+# The entire repo is uploaded on each `sky launch` (small; .venv excluded).
+workdir: .
+
+envs:
+  DEPTH: "12"                  # override via --env DEPTH=24
+  WANDB_RUN: "dummy"           # set real name via --env WANDB_RUN=d24_run1
+  SUOMICHAT_BASE_DIR: "/workspace/data"
+
+# setup: runs once per `sky launch` (cached across `sky exec`)
+setup: |
+  set -euo pipefail
+  cd ~/sky_workdir
+
+  # uv + venv (idempotent)
+  command -v uv &>/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.cargo/bin:$PATH"
+  [[ -d .venv ]] || uv venv
+  source .venv/bin/activate
+  uv sync --extra gpu --extra eval
+
+  # Ensure cache dirs exist inside the mounted volume
+  mkdir -p "$SUOMICHAT_BASE_DIR"/base_checkpoints "$SUOMICHAT_BASE_DIR"/chatsft_checkpoints
+
+  # Symlink checkpoint dirs into the checkpoints volume so they persist
+  # separately from the data volume (mirrors Modal's volume split).
+  for subdir in base_checkpoints chatsft_checkpoints; do
+    src="/workspace/checkpoints/$subdir"
+    dst="$SUOMICHAT_BASE_DIR/$subdir"
+    mkdir -p "$src"
+    [[ -L "$dst" ]] && rm "$dst" || true
+    [[ -d "$dst" && ! -L "$dst" ]] && mv "$dst"/* "$src"/ 2>/dev/null && rmdir "$dst" || true
+    ln -sfn "$src" "$dst"
+  done
+
+  echo "Setup complete. Data at $SUOMICHAT_BASE_DIR"
+
+# run: runs on every `sky launch` and `sky exec`
+run: |
+  set -euo pipefail
+  cd ~/sky_workdir
+  source .venv/bin/activate
+
+  export OMP_NUM_THREADS=1
+  export PYTHONUNBUFFERED=1
+
+  # Resolve hardware-aware config (bs, FP8, nproc, max_seq_len)
+  eval "$(python -m suomichat.hardware --depth "$DEPTH" --shell)"
+
+  echo "============================================"
+  echo " SuomiChat on Nebius (SkyPilot)"
+  echo " depth=$DEPTH | bs=$BS | fp8=$FP8 | nproc=$NPROC"
+  echo " hw: $HW_SUMMARY"
+  echo "============================================"
+
+  # Data prep — idempotent. Skips if shards/tokenizer/pre-tokenized data
+  # already present in the mounted object-storage bucket.
+  NUM_SHARDS="${NUM_SHARDS:-}"
+  if [[ -z "$NUM_SHARDS" ]]; then
+    case "$DEPTH" in
+      6)  NUM_SHARDS=8 ;;
+      12) NUM_SHARDS=30 ;;
+      16) NUM_SHARDS=60 ;;
+      20) NUM_SHARDS=139 ;;
+      24|26) NUM_SHARDS=241 ;;
+      *)  NUM_SHARDS=30 ;;
+    esac
+  fi
+  python -m scripts.prepare_data --num-shards "$NUM_SHARDS"
+  python scripts/gen_identity.py
+  python -m scripts.tok_train --vocab-size=32768
+  python -m scripts.tok_eval || true
+  python -m scripts.tokenize_shards --workers 8
+
+  # Pretrain
+  PRETRAIN_FLAGS=(
+    --depth="$DEPTH"
+    --device-batch-size="$BS"
+    --target-param-data-ratio="$RATIO"
+    --max-seq-len="$MAX_SEQ_LEN"
+    --run="$WANDB_RUN"
+    --sample-every=-1
+    --save-every=-1
+  )
+  [[ "$FP8" = "1" ]] && PRETRAIN_FLAGS+=(--fp8)
+
+  if [[ "$NPROC" -gt 1 ]]; then
+    torchrun --standalone --nproc_per_node="$NPROC" -m scripts.base_train -- "${PRETRAIN_FLAGS[@]}"
+  else
+    python -m scripts.base_train "${PRETRAIN_FLAGS[@]}"
+  fi
+
+  # SFT (uses $SUOMICHAT_BASE_DIR/sft_train.jsonl if present, else FinnishAlpaca)
+  SFT_FLAGS=(
+    --device-batch-size="$BS"
+    --max-seq-len="$MAX_SEQ_LEN"
+    --load-optimizer=0
+    --run="$WANDB_RUN"
+  )
+  if [[ "$NPROC" -gt 1 ]]; then
+    torchrun --standalone --nproc_per_node="$NPROC" -m scripts.chat_sft -- "${SFT_FLAGS[@]}"
+  else
+    python -m scripts.chat_sft "${SFT_FLAGS[@]}"
+  fi
+
+  echo "Done. Checkpoints in nebius://suomichat-checkpoints"

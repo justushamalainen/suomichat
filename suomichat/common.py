@@ -6,6 +6,7 @@ import os
 import re
 import logging
 import urllib.request
+from datetime import timedelta
 import torch
 import torch.distributed as dist
 from filelock import FileLock
@@ -197,7 +198,10 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
     if is_ddp_requested and device_type == "cuda":
         device = torch.device("cuda", ddp_local_rank)
         torch.cuda.set_device(device)  # make "cuda" default to this device
-        dist.init_process_group(backend="nccl", device_id=device)
+        # 2h timeout covers the end-of-training FIN-bench barrier where rank 0
+        # runs eval (potentially 30-60min) while ranks 1..N wait. Default NCCL
+        # timeout (~10min) would crash all non-master ranks mid-eval.
+        dist.init_process_group(backend="nccl", device_id=device, timeout=timedelta(hours=2))
         dist.barrier()
     else:
         device = torch.device(device_type) # mps|cpu
@@ -223,13 +227,15 @@ class DummyWandb:
 
 # hardcoded BF16 peak flops for various GPUs
 # inspired by torchtitan: https://github.com/pytorch/torchtitan/blob/main/torchtitan/tools/utils.py
-# and PR: https://github.com/karpathy/suomichat/pull/147
 def get_peak_flops(device_name: str) -> float:
     name = device_name.lower()
 
     # Table order matters: more specific patterns first.
     _PEAK_FLOPS_TABLE = (
-        # NVIDIA Blackwell
+        # NVIDIA Blackwell (B300 BF16 dense est. ~2.6 PFLOPS; exact Nvidia
+        # spec varies by SKU. Used for MFU calc only, minor impact on training.)
+        (["gb300"], 2.7e15),
+        (["b300"], 2.6e15),
         (["gb200"], 2.5e15),
         (["grace blackwell"], 2.5e15),
         (["b200"], 2.25e15),
@@ -248,10 +254,11 @@ def get_peak_flops(device_name: str) -> float:
         (["a800"], 312e12),
         (["a40"], 149.7e12),
         (["a30"], 165e12),
-        # NVIDIA Ada data center
+        # NVIDIA Ada data center / workstation
         (["l40s"], 362e12),
         (["l40-s"], 362e12),
         (["l40 s"], 362e12),
+        (["rtx 6000 ada"], 364e12),  # nvidia-smi: "RTX 6000 Ada Generation", BF16 tensor core peak
         (["l4"], 121e12),
         # AMD CDNA accelerators
         (["mi355"], 2.5e15),

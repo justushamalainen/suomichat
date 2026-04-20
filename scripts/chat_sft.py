@@ -12,7 +12,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-s
 import gc
 import argparse
 import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
 import torch
@@ -21,16 +21,11 @@ from suomichat.tokenizer import get_token_bytes
 from suomichat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from suomichat.loss_eval import evaluate_bpb
 import torch.distributed as dist
-from suomichat.flash_attention import HAS_FA3
-from suomichat.engine import Engine
-from scripts.chat_eval import run_chat_eval
+from suomichat.flash_attention import HAS_FA3, USE_FA3
 
 from tasks.common import TaskMixture
-from tasks.gsm8k import GSM8K
-from tasks.mmlu import MMLU
-from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
-from tasks.spellingbee import SimpleSpelling, SpellingBee
+from tasks.poro2_fi import FinnishAlpaca
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -60,12 +55,10 @@ parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR a
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=200, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
-parser.add_argument("--chatcore-every", type=int, default=200, help="evaluate ChatCORE metric every N steps (-1 = disable)")
-parser.add_argument("--chatcore-max-cat", type=int, default=-1, help="max problems per categorical task for ChatCORE")
-parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max problems per generative task for ChatCORE")
-# Data mixture
-parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
-parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
+parser.add_argument("--skip-finbench", action="store_true", help="skip end-of-training FIN-bench eval (faster iteration)")
+# Data
+parser.add_argument("--sft-file", type=str, default=None,
+                    help="path to combined Finnish SFT jsonl (default: $BASE_DIR/sft_train.jsonl, falls back to FinnishAlpaca)")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -88,12 +81,28 @@ else:
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="suomichat-sft", name=args.run, config=user_config)
 
-# Flash Attention status
-if not HAS_FA3:
-    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
-
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+
+# Flash Attention status (placed after load_model so we know the inherited window_pattern).
+# SFT cannot override window_pattern: model architecture is fixed by pretrain. So if the
+# pretrained checkpoint uses sliding windows AND we're on SDPA, the user is stuck with a
+# slow run unless they pretrain again with --window-pattern=L.
+if USE_FA3:
+    print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient.")
+else:
+    print0("!" * 80)
+    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
+        print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
+    else:
+        print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
+    print0("WARNING: SFT will be less efficient without FA3")
+    inherited_pattern = meta.get("model_config", {}).get("window_pattern", "L")
+    if inherited_pattern != "L":
+        print0(f"WARNING: pretrain used window_pattern='{inherited_pattern}', SDPA has no sliding-window support.")
+        print0("WARNING: Each attention call will materialize an explicit O(seq_len^2) mask — expect ~4x slowdown.")
+        print0("WARNING: To fix, re-pretrain with --window-pattern=L (SFT cannot change model architecture).")
+    print0("!" * 80)
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})
@@ -160,48 +169,24 @@ for group in optimizer.param_groups:
     group["lr"] = group["lr"] * args.init_lr_frac
     group["initial_lr"] = group["lr"]
 
-# SFT data mixture and DataLoader
+# SFT data: prefer combined Finnish SFT jsonl if present, else FinnishAlpaca + identity
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
-# Check for combined SFT file first (suomichat_sft_v1.train.jsonl)
-sft_file = os.path.join(base_dir, "suomichat_sft_v1.train.jsonl")
+sft_file = args.sft_file or os.path.join(base_dir, "sft_train.jsonl")
 if os.path.exists(sft_file):
     train_tasks = [CustomJSON(filepath=sft_file)]
+    val_dataset = TaskMixture([CustomJSON(filepath=sft_file, start=0, stop=500)])
     print0(f"Using combined Finnish SFT file: {sft_file}")
 else:
-    _sft_mixture = os.environ.get("SUOMICHAT_SFT_MIXTURE", "fi").lower()
-    if _sft_mixture == "en":
-        train_tasks = [
-            SmolTalk(split="train"),
-            CustomJSON(filepath=identity_conversations_filepath),
-            CustomJSON(filepath=identity_conversations_filepath),
-            *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)],
-            *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)],
-            SimpleSpelling(size=200000, split="train"),
-            SpellingBee(size=80000, split="train"),
-        ]
-        print0("Using English SFT mixture (SUOMICHAT_SFT_MIXTURE=en)")
-    else:
-        from tasks.poro2_fi import FinnishAlpaca
-        train_tasks = [
-            FinnishAlpaca(split="train"),
-            CustomJSON(filepath=identity_conversations_filepath),
-            CustomJSON(filepath=identity_conversations_filepath),
-            CustomJSON(filepath=identity_conversations_filepath),
-        ]
-        print0("Using Finnish SFT (FinnishAlpaca fallback)")
+    train_tasks = [
+        FinnishAlpaca(split="train"),
+        CustomJSON(filepath=identity_conversations_filepath),
+        CustomJSON(filepath=identity_conversations_filepath),
+        CustomJSON(filepath=identity_conversations_filepath),
+    ]
+    val_dataset = TaskMixture([FinnishAlpaca(split="train", start=0, stop=500)])
+    print0(f"SFT file not found at {sft_file}; falling back to FinnishAlpaca + identity")
 train_dataset = TaskMixture(train_tasks)
 print0(f"Training mixture: {len(train_dataset):,} rows")
-if os.path.exists(sft_file):
-    val_dataset = TaskMixture([CustomJSON(filepath=sft_file, start=0, stop=500)])
-elif _sft_mixture == "en":
-    val_dataset = TaskMixture([
-        SmolTalk(split="test"),
-        MMLU(subset="all", split="test", stop=5200),
-        GSM8K(subset="main", split="test", stop=420),
-    ])
-else:
-    from tasks.poro2_fi import FinnishAlpaca
-    val_dataset = TaskMixture([FinnishAlpaca(split="train", start=0, stop=500)])
 # DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len)
 # A big problem is that we don't know the final num_iterations in advance. So we create
 # these two global variables and update them from within the data generator.
@@ -236,7 +221,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         nonlocal cursor, epoch
         while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
-            ids, mask = tokenizer.render_conversation(conversation)
+            ids, mask = tokenizer.render_conversation(conversation, max_tokens=args.max_seq_len)
             conv_buffer.append((ids, mask))
             cursor += ddp_world_size
             if cursor >= dataset_size:
@@ -384,41 +369,6 @@ while True:
         })
         model.train()
 
-    # once in a while: estimate the ChatCORE metric (all ranks participate)
-    # use the original uncompiled model because the inputs keep changing shape
-    chatcore_results = {}
-    if args.chatcore_every > 0 and (last_step or (step > 0 and step % args.chatcore_every == 0)):
-        model.eval()
-        engine = Engine(orig_model, tokenizer)
-        all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval', 'SpellingBee']
-        categorical_tasks = {'ARC-Easy', 'ARC-Challenge', 'MMLU'}
-        baseline_accuracies = {
-            'ARC-Easy': 0.25, 'ARC-Challenge': 0.25, 'MMLU': 0.25,
-            'GSM8K': 0.0, 'HumanEval': 0.0, 'SpellingBee': 0.0,
-        }
-        task_results = {}
-        for task_name in all_tasks:
-            limit = args.chatcore_max_cat if task_name in categorical_tasks else args.chatcore_max_sample
-            max_problems = None if limit < 0 else limit  # -1 means no limit
-            acc = run_chat_eval(task_name, orig_model, tokenizer, engine,
-                                batch_size=args.device_batch_size, max_problems=max_problems)
-            task_results[task_name] = acc
-            print0(f"  {task_name}: {100*acc:.2f}%")
-        # Compute ChatCORE metrics (mean centered accuracy, ranges from 0=random to 1=perfect)
-        def centered_mean(tasks):
-            return sum((task_results[t] - baseline_accuracies[t]) / (1.0 - baseline_accuracies[t]) for t in tasks) / len(tasks)
-        chatcore = centered_mean(all_tasks)
-        chatcore_cat = centered_mean(categorical_tasks)
-        print0(f"Step {step:05d} | ChatCORE: {chatcore:.4f} | ChatCORE_cat: {chatcore_cat:.4f}")
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "chatcore_metric": chatcore,
-            "chatcore_cat": chatcore_cat,
-            **{f"chatcore/{task_name}": acc for task_name, acc in task_results.items()},
-        })
-        model.train()
-
     # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
     if last_step:
         output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
@@ -525,6 +475,32 @@ print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
 
+# End-of-training FIN-bench eval — rank-sharded across all DDP ranks via
+# NanochatLM._loglikelihood_tokens. Saves ~7× wall time on 8-GPU runs vs.
+# the prior rank-0-only pattern.
+finbench_metrics = {}
+if not args.skip_finbench:
+    try:
+        from scripts.lm_eval_wrapper import run_finbench
+        orig_model.eval()
+        fb = run_finbench(
+            orig_model, tokenizer,
+            meta={"model_config": {"sequence_len": args.max_seq_len}},
+            batch_size=args.device_batch_size,
+        )
+        if master_process:
+            finbench_metrics = {f"finbench/{k}": v for k, v in fb["per_task"].items()}
+            finbench_metrics["FIN-CORE"] = fb["composite"]
+            print0(f"FIN-CORE composite: {fb['composite']:.4f}")
+            wandb_run.log({"step": step, "fin_core": fb["composite"], **finbench_metrics})
+    except ImportError as e:
+        print0(f"Skipping FIN-bench: lm-evaluation-harness not installed ({e})")
+    except Exception as e:
+        if master_process:
+            print0(f"FIN-bench failed (continuing): {type(e).__name__}: {e}")
+    if ddp:
+        dist.barrier()
+
 # Log to report
 from suomichat.report import get_report
 get_report().log(section="SFT", data=[
@@ -535,7 +511,8 @@ get_report().log(section="SFT", data=[
     },
     { # stats about training outcomes
         "Minimum validation bpb": min_val_bpb,
-    }
+    },
+    finbench_metrics, # per-task FIN-bench scores + FIN-CORE composite (empty if skipped)
 ])
 
 # cleanup

@@ -8,11 +8,11 @@ or distributed as:
 torchrun --nproc_per_node=8 -m scripts.base_train
 
 If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
-python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
+python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --total-batch-size=512 --num-iterations=20
 """
 
 import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import gc
 import json
 import time
@@ -33,7 +33,6 @@ from suomichat.checkpoint_manager import save_checkpoint, load_checkpoint
 from suomichat.loss_eval import evaluate_bpb
 from suomichat.engine import Engine
 from suomichat.flash_attention import HAS_FA3
-from scripts.base_eval import evaluate_core
 print_banner()
 
 # -----------------------------------------------------------------------------
@@ -71,10 +70,9 @@ parser.add_argument("--resume-from-step", type=int, default=-1, help="resume tra
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
-parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
-parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--skip-finbench", action="store_true", help="skip end-of-training FIN-bench eval (faster iteration)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -435,23 +433,6 @@ while True:
         })
         model.train()
 
-    # once in a while: estimate the CORE metric (all ranks participate)
-    # use the original uncompiled model because the inputs keep changing shape
-    # disable FP8 for evaluation to use BF16 for more consistent/accurate results
-    results = {}
-    if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
-        model.eval()
-        with disable_fp8(orig_model):
-            results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
-        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
-        })
-        model.train()
-
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
@@ -599,6 +580,39 @@ print0(f"Total training time: {total_training_time/60:.2f}m")
 if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
 
+# End-of-training FIN-bench eval — rank-sharded across all DDP ranks.
+# NanochatLM._loglikelihood_tokens distributes requests[rank::world_size]
+# and all_reduces the results, so every rank does useful work. Matches
+# the pattern nanochat used for CORE eval.
+# Graceful skip if lm-evaluation-harness isn't installed.
+finbench_metrics = {}
+if not args.skip_finbench:
+    try:
+        from scripts.lm_eval_wrapper import run_finbench
+        orig_model.eval()
+        with disable_fp8(orig_model):
+            fb = run_finbench(
+                orig_model, tokenizer,
+                meta={"model_config": {"sequence_len": args.max_seq_len}},
+                batch_size=args.device_batch_size,
+            )
+        # All ranks receive the same aggregated results; only rank 0 logs.
+        if master_process:
+            finbench_metrics = {f"finbench/{k}": v for k, v in fb["per_task"].items()}
+            finbench_metrics["FIN-CORE"] = fb["composite"]
+            print0(f"FIN-CORE composite: {fb['composite']:.4f}")
+            wandb_run.log({"step": step, "fin_core": fb["composite"], **finbench_metrics})
+    except ImportError as e:
+        print0(f"Skipping FIN-bench: lm-evaluation-harness not installed ({e})")
+    except Exception as e:
+        # Exceptions happen on all ranks in the DDP case; deduplicate the
+        # rank-N warnings to avoid log spam. Rank 0 still reports.
+        if master_process:
+            print0(f"FIN-bench failed (continuing): {type(e).__name__}: {e}")
+    if ddp:
+        # Guarantee all ranks reach this point together before cleanup.
+        dist.barrier()
+
 # Log to report
 from suomichat.report import get_report
 get_report().log(section="Base model training", data=[
@@ -617,12 +631,12 @@ get_report().log(section="Base model training", data=[
     { # stats about training outcomes
         "Minimum validation bpb": min_val_bpb if val_bpb is not None else None,
         "Final validation bpb": val_bpb,
-        "CORE metric estimate": results.get("core_metric", None),
         "MFU %": f"{mfu:.2f}%",
         "Total training flops": f"{flops_so_far:e}",
         "Total training time": f"{total_training_time/60:.2f}m",
         "Peak memory usage": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
-    }
+    },
+    finbench_metrics, # per-task FIN-bench scores + FIN-CORE composite (empty if skipped)
 ])
 
 # cleanup

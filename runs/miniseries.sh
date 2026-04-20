@@ -17,9 +17,9 @@ if [ -z "$SKIP_SETUP" ]; then
     uv sync --extra gpu
     source .venv/bin/activate
 
-    # Tokenizer, download 1000 shards for pretraining
-    # (probably this can be reduced but it's tricky to determine the exact right number, TODO).
-    python -m suomichat.dataset -n 1000
+    # Tokenizer, download enough Finnish shards for the deepest model in the series
+    # (1000 shards = ~250B chars, more than enough for d12-d26 sweeps).
+    python -m scripts.prepare_data --num-shards 1000
     python -m scripts.tok_train --max-chars=2000000000 --vocab-size=32768
 else
     source .venv/bin/activate
@@ -40,7 +40,7 @@ RESULTS_FILE="$RESULTS_DIR/results.csv"
 
 # Write CSV header only if file doesn't exist
 if [ ! -f "$RESULTS_FILE" ]; then
-    echo "depth,model_dim,num_params,num_scaling_params,num_iterations,tokens_trained,param_data_ratio,val_bpb,core_score,train_time_sec" > "$RESULTS_FILE"
+    echo "depth,model_dim,num_params,num_scaling_params,num_iterations,tokens_trained,param_data_ratio,val_bpb,train_time_sec" > "$RESULTS_FILE"
 fi
 
 log() {
@@ -70,8 +70,6 @@ for d in "${DEPTHS[@]}"; do
         --depth=$d \
         --run="${WANDB_RUN}_d${d}" \
         --model-tag="${TAG}" \
-        --core-metric-every=999999 \
-        --core-metric-max-per-task=-1 \
         --sample-every=-1 \
         --save-every=-1 \
         $DEVICE_BATCH_SIZE_ARG \
@@ -89,16 +87,11 @@ for d in "${DEPTHS[@]}"; do
     PARAM_DATA_RATIO=$(python -c "print(f'{$TOKENS_TRAINED / $NUM_SCALING_PARAMS:.2f}')")
     MODEL_DIM=$((d * 64))
     VAL_BPB=$(grep "Validation bpb:" "$LOG_FILE" | tail -1 | grep -oP '[\d.]+$')
-    CORE_SCORE=$(grep "CORE metric:" "$LOG_FILE" | tail -1 | awk '{print $NF}')
 
-    if [ -z "$CORE_SCORE" ]; then
-        CORE_SCORE="0.0"
-    fi
-
-    log "  d=$d: params=$NUM_PARAMS, scaling=$NUM_SCALING_PARAMS, ratio=$PARAM_DATA_RATIO, bpb=$VAL_BPB, CORE=$CORE_SCORE, time=${TRAIN_TIME}s"
+    log "  d=$d: params=$NUM_PARAMS, scaling=$NUM_SCALING_PARAMS, ratio=$PARAM_DATA_RATIO, bpb=$VAL_BPB, time=${TRAIN_TIME}s"
 
     # Append to CSV
-    echo "$d,$MODEL_DIM,$NUM_PARAMS,$NUM_SCALING_PARAMS,$NUM_ITERS,$TOKENS_TRAINED,$PARAM_DATA_RATIO,$VAL_BPB,$CORE_SCORE,$TRAIN_TIME" >> "$RESULTS_FILE"
+    echo "$d,$MODEL_DIM,$NUM_PARAMS,$NUM_SCALING_PARAMS,$NUM_ITERS,$TOKENS_TRAINED,$PARAM_DATA_RATIO,$VAL_BPB,$TRAIN_TIME" >> "$RESULTS_FILE"
 done
 
 log "=============================================="
