@@ -1,18 +1,21 @@
 # SuomiChat
 
 Finnish LLM training harness. Train a Finnish GPT from scratch on whatever
-GPU you have — single 48GB workstation card up to 8× H100 cluster.
+GPU you have — single 48 GB workstation card up to 8× H100 cluster.
 
-Fork of [karpathy/nanochat](https://github.com/karpathy/nanochat) — same
-architecture, optimizer, and training infrastructure, configured Finnish
-from the ground up: Finnish pretraining data, Finnish tokenizer, Finnish
-SFT, Finnish evaluation.
+> **Attribution**: SuomiChat is built on top of
+> [karpathy/nanochat](https://github.com/karpathy/nanochat). The GPT
+> architecture, Muon+AdamW optimizer, Flash Attention integration, FP8
+> training path, inference engine, KV cache, and tool-execution loop are
+> inherited from nanochat.
+
+The code is adapted to work with Finnish datasets and evals.
 
 ## Quick start
 
 ```bash
 # Setup
-git clone <this-repo> && cd suomichat
+git clone https://github.com/justushamalainen/suomichat && cd suomichat
 uv venv && uv sync --extra gpu --extra eval   # eval extra pulls FIN-bench harness
 source .venv/bin/activate
 
@@ -25,22 +28,6 @@ python -m scripts.chat_web              # web UI at :8000
 python -m scripts.run_finbench --source sft
 ```
 
-## What's different from nanochat?
-
-| Component | nanochat | suomichat |
-|---|---|---|
-| Pretraining data | ClimbMix (English, 400B tokens) | FineWeb2-fi + Wikipedia-fi + HPLT-fi + mC4-fi + Reddit-fi |
-| Tokenizer | English BPE (32K vocab) | Finnish BPE (32K vocab, ~4.8 chars/tok) |
-| SFT data | SmolTalk + MMLU + GSM8K | FinnishAlpaca + Finnish identity (+ optional curated v2 mixture) |
-| Evaluation | DCLM CORE (English) | FIN-bench-v2 (Finnish) |
-| Identity | English assistant | SuomiChat — suomenkielinen assistentti |
-| Web UI | English | Finnish |
-| Knobs | many | one (`--depth`); rest auto-detected from GPU |
-
-Everything else (GPT architecture, Muon+AdamW optimizer, Flash Attention,
-FP8, distributed training, inference engine, KV cache, code execution) is
-identical to nanochat.
-
 ## Hardware autodetect
 
 `suomichat/hardware.py` inspects the GPU at startup and picks
@@ -49,8 +36,8 @@ identical to nanochat.
 | Hardware | Detected | d6 | d12 | d20 | d24 |
 |---|---|---|---|---|---|
 | RTX 6000 Ada (48GB) | SM 8.9, no FA3, no FP8 | bs=32 | bs=16 | bs=4 | bs=1 (warn — likely OOM) |
-| 1× H100 (80GB) | SM 9.0, FA3, FP8 | bs=64 | bs=32 | bs=16 | bs=16 +FP8 |
-| 8× H100 (8×80GB) | SM 9.0, FA3, FP8 | bs=64 | bs=32 | bs=16 | bs=16 +FP8 |
+| 1× H100 (80GB) | SM 9.0, FA3, FP8 | bs=64 | bs=32 | bs=16 FP8 | bs=32 FP8 |
+| 8× H100 (8×80GB) | SM 9.0, FA3, FP8 | bs=64 | bs=32 | bs=16 FP8 | bs=32 FP8 |
 
 Override with `SUOMICHAT_BS=N` or `SUOMICHAT_NPROC=N`.
 
@@ -77,6 +64,7 @@ suomichat/hardware.py       → Hardware autodetect + recommend_config(depth)
 | 12 | ~286M | ~6 hours | ~1 hour | ~15 min |
 | 20 | ~896M | multi-day | ~10 hours | ~2 hours |
 | 24 | ~1.4B | won't fit | ~16 hours (FP8) | ~2.5 hours (FP8) |
+| 26 | ~1.9B | won't fit | ~24 hours (FP8) | ~3 hours (FP8) |
 
 Pick the deepest model your hardware tier can handle. The wrapper picks
 batch size and parallelism for you.
@@ -92,8 +80,8 @@ Pretraining mix (configured in `scripts/prepare_data.py`):
 
 SFT data:
 - Default: [datacrunch/finnish_alpaca](https://huggingface.co/datasets/datacrunch/finnish_alpaca) (52K rows) + Finnish identity conversations from `scripts/gen_identity.py`
-- Bring your own: any Finnish jsonl in suomichat conversation format works.
-  Each line is a JSON list of `{role, content}` messages (optional `system`
+- Bring your own: any Finnish jsonl in conversation format works. Each
+  line is a JSON list of `{role, content}` messages (optional `system`
   at position 0). Place at `$SUOMICHAT_BASE_DIR/sft_train.jsonl` or pass
   `--sft-file=PATH` to `chat_sft`.
 
@@ -109,19 +97,44 @@ modal volume get suomichat-checkpoints / ./out/      # download
 
 See `modal/README.md` for cost estimates and data upload instructions.
 
+## Running on Nebius (bare-metal H100)
+
+```bash
+# SkyPilot (recommended — declarative, autostop, multi-cloud)
+pip install "skypilot-nightly[nebius]"
+sky launch -c suomichat nebius/suomichat.yaml --env DEPTH=24
+sky exec suomichat nebius/suomichat.yaml --env DEPTH=26    # reuse cluster
+sky autostop suomichat -i 30                                # idle-shutdown
+
+# Or bare-metal SSH
+bash nebius/train.sh --depth 24
+```
+
+See `nebius/README.md` for provisioning, cost reference, Object Storage
+mounts, and Blackwell/B300 notes.
+
 ## Evaluation
 
-FIN-bench-v2 runs automatically at the end of `base_train` and `chat_sft`.
-Per-task scores and the FIN-CORE composite land in wandb and the report.
-Pass `--skip-finbench` to disable for fast iteration.
+FIN-bench-v2 runs automatically at the end of `base_train` and `chat_sft`
+(rank-sharded across all DDP ranks so the whole cluster evaluates in
+parallel). Per-task scores and the FIN-CORE composite land in wandb and
+the report.
+
+Default suite is 6 MCF tasks (multiple-choice format — model picks
+A/B/C/D). MCF is more robust for small models than CF (continuation
+loglikelihood) because every choice is a single letter token, so
+fluency/frequency bias doesn't dominate.
 
 Standalone:
 
 ```bash
 python -m scripts.run_finbench --source sft               # full FIN-CORE suite
 python -m scripts.run_finbench --source sft --limit 100   # quick smoke
-python -m scripts.run_finbench --tasks belebele_fin_cf_fbv2_p0  # one task
+python -m scripts.run_finbench --tasks belebele_fin_mcf_fbv2_p0  # one task
 ```
+
+Pass `--skip-finbench` to `base_train` / `chat_sft` to disable the
+automatic post-training eval.
 
 ### Installing lm-evaluation-harness manually
 
@@ -132,6 +145,8 @@ git clone https://github.com/LumiOpen/lm-evaluation-harness ../lm-evaluation-har
 uv pip install -e ../lm-evaluation-harness
 ```
 
+Pinned commit: `6e0a60abb74cf098bc5511b25caf66566586f9f0`.
+
 ## Environment
 
 ```bash
@@ -141,10 +156,46 @@ export SUOMICHAT_BS=N                     # override autodetected batch size
 export SUOMICHAT_NPROC=N                  # override GPU count
 ```
 
+## Inference
+
+```bash
+python -m scripts.chat_cli -g d26 -p "Mikä on Suomen pääkaupunki?"
+python -m scripts.chat_web -g d26 --repetition-penalty 1.3   # web UI on :8000
+```
+
+`--repetition-penalty` (default 1.3) reduces the model's tendency to
+ramble or repeat itself. Can also be set per-request in the
+`/chat/completions` API.
+
+## Data attribution
+
+The Finnish datasets and evaluation tasks that make this project work
+are maintained by others. Please cite them if you use the resulting
+model or any of its components downstream.
+
+**Pretraining data** — [Finnish-NLP](https://huggingface.co/Finnish-NLP)
+(TurkuNLP / University of Turku and collaborators):
+- [Fineweb2_Finnish_fineweb_edu_predicted](https://huggingface.co/datasets/Finnish-NLP/Fineweb2_Finnish_fineweb_edu_predicted)
+- [wikipedia_20230501_fi_cleaned](https://huggingface.co/datasets/Finnish-NLP/wikipedia_20230501_fi_cleaned)
+- [HPLT_1.2_fi_cleaned](https://huggingface.co/datasets/Finnish-NLP/HPLT_1.2_fi_cleaned)
+- [mc4_fi_cleaned](https://huggingface.co/datasets/Finnish-NLP/mc4_fi_cleaned)
+- [Reddit_fi_2006_2022](https://huggingface.co/datasets/Finnish-NLP/Reddit_fi_2006_2022)
+
+**SFT data**:
+- [datacrunch/finnish_alpaca](https://huggingface.co/datasets/datacrunch/finnish_alpaca) — 52K Finnish Alpaca-style instruction pairs (DataCrunch.io)
+- [LumiOpen/poro2-instruction-collection](https://huggingface.co/datasets/LumiOpen/poro2-instruction-collection) — multilingual instruction collection, filtered to Finnish (LumiOpen / Silo AI)
+- [Chaanim/finnish_math_reasoning](https://huggingface.co/datasets/Chaanim/finnish_math_reasoning) — ~100K Finnish math problems with chain-of-thought reasoning
+
+**Evaluation** — [FIN-bench-v2](https://github.com/TurkuNLP/FIN-bench) and
+its LumiOpen [lm-evaluation-harness](https://github.com/LumiOpen/lm-evaluation-harness)
+fork. Tasks used in FIN-CORE: GoldenSwag-HT-FI, ScandiSent-FI,
+SIB200-FI, Belebele-FIN, FIN-bench analogies, FIN-bench general
+knowledge (authored/translated by TurkuNLP, LumiOpen, and the original
+benchmark contributors — see each task's citation).
+
+**Model architecture + training infrastructure** —
+[karpathy/nanochat](https://github.com/karpathy/nanochat) (Andrej Karpathy).
+
 ## License
 
-MIT (inherited from nanochat)
-
-## Attribution
-
-Based on [nanochat](https://github.com/karpathy/nanochat) by Andrej Karpathy.
+MIT.
