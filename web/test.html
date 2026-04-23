@@ -14,7 +14,8 @@ which the Python driver invokes.</p>
 <pre id="status">Initialising…</pre>
 
 <script type="module">
-import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul } from "./runtime.js";
+import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul,
+         add, mul, scalarMul, relu2, sigmoid } from "./runtime.js";
 
 const status = document.getElementById("status");
 
@@ -47,6 +48,26 @@ const status = document.getElementById("status");
           const b = new Float32Array(args.b);
           const result = await matmul(device, model, a, args.aShape, b, args.bShape);
           return Array.from(result);
+        }
+        case "add": {
+          const r = await add(device, model, new Float32Array(args.a), new Float32Array(args.b));
+          return Array.from(r);
+        }
+        case "mul": {
+          const r = await mul(device, model, new Float32Array(args.a), new Float32Array(args.b));
+          return Array.from(r);
+        }
+        case "scalar_mul": {
+          const r = await scalarMul(device, model, new Float32Array(args.a), args.alpha);
+          return Array.from(r);
+        }
+        case "relu2": {
+          const r = await relu2(device, model, new Float32Array(args.a));
+          return Array.from(r);
+        }
+        case "sigmoid": {
+          const r = await sigmoid(device, model, new Float32Array(args.a));
+          return Array.from(r);
         }
         default:
           throw new Error("unknown op: " + op);

@@ -53,6 +53,13 @@ def ref_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return a @ b
 
 
+def ref_add(a, b):         return a + b
+def ref_mul(a, b):         return a * b
+def ref_scalar_mul(a, alpha): return alpha * a
+def ref_relu2(a):          return torch.nn.functional.relu(a).square()
+def ref_sigmoid(a):        return torch.sigmoid(a)
+
+
 # ----------------------------------------------------------------------
 # Headless Chrome driver
 # ----------------------------------------------------------------------
@@ -152,6 +159,40 @@ async def test_matmul(seed: int = 0, M: int = 1, K: int = 768, N: int = 768, ato
     return False
 
 
+async def _run_elem(op: str, pyref, args_js: dict, ref_args: tuple, atol: float):
+    print(f"--- test: {op} ---")
+    ref = pyref(*ref_args).numpy()
+    got = await run_browser_op(op, args_js)
+    got = torch.tensor(got, dtype=torch.float32).numpy()
+    if got.shape != ref.shape:
+        print(f"  SHAPE MISMATCH: ref={ref.shape}, got={got.shape}")
+        return False
+    diff = abs(ref - got).max()
+    print(f"  max abs diff: {diff:.3e}  (tol {atol:.0e})")
+    if diff <= atol:
+        print("  ✓ PASS")
+        return True
+    print(f"  ref[:4]: {ref[:4]}")
+    print(f"  got[:4]: {got[:4]}")
+    print("  ✗ FAIL")
+    return False
+
+
+async def test_elementwise(seed: int = 0, n: int = 768):
+    g = torch.Generator().manual_seed(seed)
+    a = torch.randn(n, dtype=torch.float32, generator=g)
+    b = torch.randn(n, dtype=torch.float32, generator=g)
+    alpha = 3.5
+    results = [
+        await _run_elem("add", ref_add, {"a": a.tolist(), "b": b.tolist()}, (a, b), 0),
+        await _run_elem("mul", ref_mul, {"a": a.tolist(), "b": b.tolist()}, (a, b), 0),
+        await _run_elem("scalar_mul", ref_scalar_mul, {"a": a.tolist(), "alpha": alpha}, (a, alpha), 0),
+        await _run_elem("relu2", ref_relu2, {"a": a.tolist()}, (a,), 0),
+        await _run_elem("sigmoid", ref_sigmoid, {"a": a.tolist()}, (a,), 1e-6),  # exp drift
+    ]
+    return all(results)
+
+
 async def test_rmsnorm(seed: int = 0, n: int = 768, atol: float = 1e-5):
     print(f"--- test: rmsnorm (n={n}, seed={seed}) ---")
     g = torch.Generator().manual_seed(seed)
@@ -198,6 +239,7 @@ async def main():
     passed.append(await test_matmul(seed=0, M=1, K=768, N=768))       # shape: Q projection on one token
     passed.append(await test_matmul(seed=1, M=768, K=768, N=2048))    # shape: MLP c_fc
     passed.append(await test_matmul(seed=2, M=2, K=3, N=4))           # tiny sanity check
+    passed.append(await test_elementwise(seed=0, n=768))              # add/mul/scalar_mul/relu2/sigmoid
 
     # Future: test_rope, test_attention, test_full_forward, etc.
 

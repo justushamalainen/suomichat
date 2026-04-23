@@ -243,6 +243,93 @@ export async function matmul(device, model, a, aShape, b, bShape) {
 }
 
 // ---------------------------------------------------------------------
+// Element-wise ops (add, mul, scalar_mul, relu2, sigmoid).
+// All take Float32Array input(s) + return Float32Array for test-friendliness.
+// ---------------------------------------------------------------------
+function buildBinaryUniforms(device, n) {
+  const ub = new ArrayBuffer(16);
+  new Uint32Array(ub, 0, 1)[0] = n;
+  const buf = device.createBuffer({
+    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(buf, 0, ub);
+  return buf;
+}
+
+async function _elemBinary(device, model, name, a, b) {
+  if (a.length !== b.length) throw new Error(`${name}: shape mismatch ${a.length} vs ${b.length}`);
+  const n = a.length;
+  const pipeline = await getPipeline(device, model, name);
+  const aBuf = uploadF32(device, `${name}_a`, a);
+  const bBuf = uploadF32(device, `${name}_b`, b);
+  const cBuf = device.createBuffer({
+    label: `${name}_c`, size: n * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  const uniforms = buildBinaryUniforms(device, n);
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: aBuf } },
+      { binding: 1, resource: { buffer: bBuf } },
+      { binding: 2, resource: { buffer: cBuf } },
+      { binding: 3, resource: { buffer: uniforms } },
+    ],
+  });
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(n / 64));
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  const result = await downloadF32(device, cBuf, n * 4);
+  aBuf.destroy(); bBuf.destroy(); cBuf.destroy(); uniforms.destroy();
+  return result;
+}
+
+async function _elemUnary(device, model, name, a, extraFloat = null) {
+  const n = a.length;
+  const pipeline = await getPipeline(device, model, name);
+  const aBuf = uploadF32(device, `${name}_a`, a);
+  const cBuf = device.createBuffer({
+    label: `${name}_c`, size: n * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  const ub = new ArrayBuffer(16);
+  new Uint32Array(ub, 0, 1)[0] = n;
+  if (extraFloat !== null) new Float32Array(ub, 4, 1)[0] = extraFloat;
+  const uniforms = device.createBuffer({
+    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(uniforms, 0, ub);
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: aBuf } },
+      { binding: 1, resource: { buffer: cBuf } },
+      { binding: 2, resource: { buffer: uniforms } },
+    ],
+  });
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(n / 64));
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  const result = await downloadF32(device, cBuf, n * 4);
+  aBuf.destroy(); cBuf.destroy(); uniforms.destroy();
+  return result;
+}
+
+export const add         = (device, model, a, b)        => _elemBinary(device, model, "add", a, b);
+export const mul         = (device, model, a, b)        => _elemBinary(device, model, "mul", a, b);
+export const scalarMul   = (device, model, a, alpha)    => _elemUnary (device, model, "scalar_mul", a, alpha);
+export const relu2       = (device, model, a)           => _elemUnary (device, model, "relu2", a);
+export const sigmoid     = (device, model, a)           => _elemUnary (device, model, "sigmoid", a);
+
+// ---------------------------------------------------------------------
 // 8. RMSNorm.
 // ---------------------------------------------------------------------
 //
