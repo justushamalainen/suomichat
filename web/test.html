@@ -18,7 +18,7 @@ import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul, linear,
          add, mul, scalarMul, relu2, sigmoid, ropeApply, mlpBlock,
          attentionBlock, transformerBlock, forward, softmax,
          initKVCache, destroyKVCache, greedyGenerate } from "./runtime.js";
-import { loadTokenizer, decodeTokens } from "./tokenizer.js";
+import { loadTokenizer, decodeTokens, encodeOrdinary, renderForCompletion } from "./tokenizer.js";
 
 const status = document.getElementById("status");
 
@@ -109,6 +109,14 @@ const status = document.getElementById("status");
           // ids (array of int) → string. Loads tokenizer JSON on first call.
           if (!window._tok) window._tok = await loadTokenizer();
           return decodeTokens(window._tok, args.ids, { skipSpecial: !!args.skipSpecial });
+        }
+        case "tokenizer_encode": {
+          if (!window._tok) window._tok = await loadTokenizer();
+          return encodeOrdinary(window._tok, args.text);
+        }
+        case "tokenizer_render": {
+          if (!window._tok) window._tok = await loadTokenizer();
+          return renderForCompletion(window._tok, args.messages);
         }
         case "greedy_generate": {
           // promptTokens (array of int), maxNew (int) → full token list.

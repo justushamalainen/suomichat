@@ -34,25 +34,26 @@
 <div id="chat" hidden>
   <div id="conversation"></div>
   <div class="ctrl">
-    <label>Prompt:</label>
-    <select id="promptSel"></select>
+    <input id="promptIn" type="text" placeholder="Kysy jotain suomeksi…" style="flex:1; padding:0.4rem; font-size:14px">
     <label>Tokens:</label>
     <input id="maxNew" type="number" value="32" min="1" max="128" style="width:5em">
     <button id="send" disabled>Generate</button>
+  </div>
+  <div class="ctrl" style="margin-top:0.25rem; font-size:12px; color:#666">
+    <span>Quick picks:</span>
+    <span id="picks"></span>
   </div>
 </div>
 
 <script type="module">
 import { initWebGPU, loadModel, greedyGenerate } from "./runtime.js";
-import { loadTokenizer, decodeTokens } from "./tokenizer.js";
+import { loadTokenizer, decodeTokens, renderForCompletion } from "./tokenizer.js";
 
-// Pre-tokenized demo prompts (computed offline by suomichat tokenizer.render_for_completion).
-// To add more: cd web && SUOMICHAT_BASE_DIR=... python -c "..."
+// Demo prompts shown as quick picks. Free-text input below.
 const DEMO_PROMPTS = [
-  { label: "Moi! Kuka olet?",
-    ids: [32759, 32760, 27354, 33, 12733, 2140, 63, 32761, 32762] },
-  { label: "Mikä on Suomen pääkaupunki?",
-    ids: [32759, 32760, 31218, 8170, 25148, 4140, 13443, 70, 63, 32761, 32762] },
+  "Moi! Kuka olet?",
+  "Mikä on Suomen pääkaupunki?",
+  "Kerro vitsi.",
 ];
 
 const statusEl = document.getElementById("status");
@@ -60,7 +61,8 @@ const chatEl   = document.getElementById("chat");
 const convEl   = document.getElementById("conversation");
 const sendBtn  = document.getElementById("send");
 const bootBtn  = document.getElementById("boot");
-const sel      = document.getElementById("promptSel");
+const promptIn = document.getElementById("promptIn");
+const picksEl  = document.getElementById("picks");
 const maxNewIn = document.getElementById("maxNew");
 
 function log(msg, cls) {
@@ -95,11 +97,13 @@ bootBtn.onclick = async () => {
     tokenizer = await loadTokenizer();
     log(`    ✓ vocab=${tokenizer.nVocab}, ${Object.keys(tokenizer.specialTokens).length} special tokens`, "ok");
 
-    for (const p of DEMO_PROMPTS) {
-      const opt = document.createElement("option");
-      opt.value = p.ids.join(",");
-      opt.textContent = p.label;
-      sel.appendChild(opt);
+    for (const text of DEMO_PROMPTS) {
+      const a = document.createElement("a");
+      a.href = "#";
+      a.textContent = text;
+      a.style.marginRight = "0.5rem";
+      a.onclick = (ev) => { ev.preventDefault(); promptIn.value = text; };
+      picksEl.appendChild(a);
     }
     chatEl.hidden = false;
     sendBtn.disabled = false;
@@ -112,9 +116,11 @@ bootBtn.onclick = async () => {
 };
 
 sendBtn.onclick = async () => {
+  const promptText = promptIn.value.trim();
+  if (!promptText) return;
   sendBtn.disabled = true;
-  const promptIds = sel.value.split(",").map(Number);
-  const promptText = sel.options[sel.selectedIndex].textContent;
+  const promptIds = renderForCompletion(tokenizer,
+    [{ role: "user", content: promptText }]);
   const maxNew = Math.max(1, Math.min(128, parseInt(maxNewIn.value, 10) || 32));
 
   const userDiv = document.createElement("div");

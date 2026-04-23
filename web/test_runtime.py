@@ -268,6 +268,42 @@ async def test_full_forward(model, token_id: int = 100, atol: float = 0.3):
     return False
 
 
+async def test_tokenizer_encode(prompt_text: str = "Moi! Kuka olet?"):
+    """JS BPE encoder vs PyTorch tiktoken encode_ordinary. Exact match."""
+    print(f"--- test: tokenizer_encode {prompt_text!r} ---")
+    from suomichat.tokenizer import get_tokenizer
+    tok = get_tokenizer()
+    ref = tok.enc.encode_ordinary(prompt_text)
+    got = await run_browser_op("tokenizer_encode", {"text": prompt_text})
+    print(f"  ref: {ref}")
+    print(f"  got: {got}")
+    if ref == got:
+        print("  ✓ PASS")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
+async def test_tokenizer_render(prompt_text: str = "Moi! Kuka olet?"):
+    """JS renderForCompletion vs PyTorch render_for_completion. Exact match."""
+    print(f"--- test: tokenizer_render {prompt_text!r} ---")
+    from suomichat.tokenizer import get_tokenizer
+    tok = get_tokenizer()
+    conv = {"messages": [{"role": "user", "content": prompt_text},
+                          {"role": "assistant", "content": ""}]}
+    ref = tok.render_for_completion(conv)
+    got = await run_browser_op("tokenizer_render", {
+        "messages": [{"role": "user", "content": prompt_text}],
+    })
+    print(f"  ref: {ref}")
+    print(f"  got: {got}")
+    if ref == got:
+        print("  ✓ PASS")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_tokenizer_decode(prompt_text: str = "Moi! Kuka olet?"):
     """Decode-roundtrip: encode in PyTorch, decode in JS, compare strings."""
     print(f"--- test: tokenizer_decode {prompt_text!r} ---")
@@ -669,6 +705,10 @@ async def main():
     passed.append(await test_kv_cache_two_tokens(model, t0=42, t1=42))  # repeat token edge
     passed.append(await test_greedy_generate(model, prompt_tokens=(100, 7), max_new=8))
     passed.append(await test_tokenizer_decode("Moi! Kuka olet?"))
+    passed.append(await test_tokenizer_encode("Moi! Kuka olet?"))
+    passed.append(await test_tokenizer_encode("hei maailma"))
+    passed.append(await test_tokenizer_encode("Suomen pääkaupunki on Helsinki."))   # ä, multi-byte UTF-8
+    passed.append(await test_tokenizer_render("Moi! Kuka olet?"))
     passed.append(await test_chat_e2e(model, "Moi! Kuka olet?", max_new=8))
 
     n_pass = sum(passed)

@@ -57,12 +57,18 @@ def main():
         except Exception:
             pass
 
+    # First non-special id (= len of mergeable_ranks). Anything < this is
+    # a regular BPE merge; anything >= this is a special token.
+    n_merges = len(enc._mergeable_ranks)
+
     out = {
         "n_vocab": n_vocab,
         "vocab_b64": vocab_b64,
+        "n_merges": n_merges,
         "special_tokens": special,
         "bos_id": tok.bos_token_id,
         "eot_id": special.get("<|endoftext|>") or special.get("<|bos|>"),
+        "pat_str": enc._pat_str,    # GPT-4-style split regex (Python re syntax)
     }
     Path(args.out).write_text(json.dumps(out))
     print(f"wrote {args.out}  ({n_vocab} tokens, {len(special)} special)")
