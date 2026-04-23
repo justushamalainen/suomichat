@@ -192,7 +192,7 @@ skip them for the first attention test.
 - **Ref**: `model(torch.tensor([[token_id]]))` → logits
 - **Acceptance**: `atol=1e-3`.
 
-### Phase 11 — KV cache
+### ✅ Phase 11 — KV cache (done — combined with Phase 12)
 
 Everything up to phase 10 was T=1 / no cache. This phase adds persistent
 K/V buffers so subsequent tokens can attend over history.
@@ -211,7 +211,7 @@ K/V buffers so subsequent tokens can attend over history.
 - **Ref**: `list(model.generate([bos, token1], max_tokens=1, temperature=0))`
 - **Acceptance**: picked token IDs **match exactly** (greedy is deterministic).
 
-### Phase 12 — Smear gate
+### ✅ Phase 12 — Smear gate (done — combined with Phase 11)
 
 Smear applies from step 2 onward (when there's a previous embedding).
 Requires a new `prev_embedding` cache buffer.
@@ -229,7 +229,7 @@ Requires a new `prev_embedding` cache buffer.
 - **Ref**: PyTorch's `model.forward` with `kv_cache` populated.
 - **Acceptance**: picked token IDs match exactly.
 
-### Phase 13 — Sampling + generation loop
+### ✅ Phase 13 — Sampling + generation loop (done)
 
 - **Runtime**:
   - `argmax(device, logitsBuf, vocabSize)` shader — returns a single u32.
@@ -243,7 +243,29 @@ Requires a new `prev_embedding` cache buffer.
 - **Ref**: `list(model.generate(prompt_tokens, max_tokens=16, temperature=0))`
 - **Acceptance**: exact match on all 16 tokens.
 
-### Phase 14 — Tokenizer + chat UI
+### ✅ Phase 14a — Decode + chat UI w/ pre-tokenized prompts (done)
+
+Implemented:
+- `export_tokenizer.py` dumps id→bytes (base64) + special token IDs to
+  `web/tokenizer.json` (~470 KB).
+- `tokenizer.js` (`loadTokenizer`, `decodeTokens`).
+- `index.html` chat UI with hard-coded Finnish demo prompts.
+- `test_chat_e2e`: 8/8 token match vs PyTorch for "Moi! Kuka olet?",
+  decoded output reads "Moi! Olen Suomi" — readable Finnish.
+
+### Phase 14b — Live BPE encoder (next)
+
+So users can type arbitrary prompts:
+- Extend `export_tokenizer.py` to also dump BPE merges (rank table) and
+  the GPT-4-style split regex pattern.
+- Implement BPE encode in `tokenizer.js`: split → byte-pair merge by
+  rank → emit ids. Include special token handling (`<|user_start|>`
+  etc.) so we can build chat prompts in-browser.
+- Test: `test_tokenizer_encode` (text → ids must match PyTorch's
+  `encode_ordinary`) and `test_chat_input_e2e` (typed message →
+  rendered prompt → generation matches PyTorch greedy).
+
+### Phase 14 — Original (kept for reference)
 
 - **Runtime**:
   - Load `tokenizer.json` via the `@huggingface/tokenizers` WASM build
