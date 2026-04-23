@@ -2,3 +2,4 @@
 weights.bin
 tensors.json
 config.json
+tokenizer.json

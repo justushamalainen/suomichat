@@ -268,6 +268,71 @@ async def test_full_forward(model, token_id: int = 100, atol: float = 0.3):
     return False
 
 
+async def test_tokenizer_decode(prompt_text: str = "Moi! Kuka olet?"):
+    """Decode-roundtrip: encode in PyTorch, decode in JS, compare strings."""
+    print(f"--- test: tokenizer_decode {prompt_text!r} ---")
+    from suomichat.tokenizer import get_tokenizer
+    tok = get_tokenizer()
+    ids = tok.enc.encode_ordinary(prompt_text)
+    ref = tok.enc.decode(ids)
+    got = await run_browser_op("tokenizer_decode", {"ids": ids, "skipSpecial": True})
+    print(f"  ids: {ids}")
+    print(f"  ref: {ref!r}")
+    print(f"  got: {got!r}")
+    if ref == got:
+        print("  ✓ PASS")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
+async def test_chat_e2e(model, prompt_text: str = "Moi! Kuka olet?", max_new: int = 8):
+    """End-to-end: render chat prompt, generate in browser, compare token
+    sequences against PyTorch greedy reference. Also decode and print so
+    we see what the model actually said."""
+    print(f"--- test: chat_e2e {prompt_text!r} max_new={max_new} ---")
+    from suomichat.tokenizer import get_tokenizer
+    tok = get_tokenizer()
+    conv = {"messages": [{"role": "user", "content": prompt_text}, {"role": "assistant", "content": ""}]}
+    prompt_ids = tok.render_for_completion(conv)
+
+    # PyTorch greedy reference
+    ref_ids = list(prompt_ids)
+    with torch.no_grad():
+        for _ in range(max_new):
+            t = torch.tensor([ref_ids])
+            logits = model(t)[0, -1].cpu().float().numpy()
+            ref_ids.append(int(logits.argmax()))
+
+    # WebGPU generation
+    got_ids = await run_browser_op("greedy_generate", {
+        "promptTokens": list(prompt_ids),
+        "maxNew": max_new,
+        "maxSeqLen": len(prompt_ids) + max_new + 4,
+    })
+
+    # Decode for visibility
+    got_tail = got_ids[len(prompt_ids):]
+    ref_tail = ref_ids[len(prompt_ids):]
+    text = tok.decode(got_tail)
+    print(f"  prompt: {prompt_ids}")
+    print(f"  ref tail: {ref_tail}")
+    print(f"  got tail: {got_tail}")
+    print(f"  decoded: {text!r}")
+
+    matched = 0
+    for i in range(max_new):
+        if ref_tail[i] == got_tail[i]: matched += 1
+        else: break
+    required = (max_new + 1) // 2
+    print(f"  matched {matched}/{max_new} (required >= {required})")
+    if matched >= required:
+        print("  ✓ PASS")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_greedy_generate(model, prompt_tokens=(100, 7), max_new: int = 8):
     """Greedy autoregressive generation. Compares the WebGPU output token
     sequence against PyTorch ref (forward + argmax loop).
@@ -603,6 +668,8 @@ async def main():
     passed.append(await test_kv_cache_two_tokens(model, t0=100, t1=7))
     passed.append(await test_kv_cache_two_tokens(model, t0=42, t1=42))  # repeat token edge
     passed.append(await test_greedy_generate(model, prompt_tokens=(100, 7), max_new=8))
+    passed.append(await test_tokenizer_decode("Moi! Kuka olet?"))
+    passed.append(await test_chat_e2e(model, "Moi! Kuka olet?", max_new=8))
 
     n_pass = sum(passed)
     n_total = len(passed)

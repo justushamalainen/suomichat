@@ -18,6 +18,7 @@ import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul, linear,
          add, mul, scalarMul, relu2, sigmoid, ropeApply, mlpBlock,
          attentionBlock, transformerBlock, forward, softmax,
          initKVCache, destroyKVCache, greedyGenerate } from "./runtime.js";
+import { loadTokenizer, decodeTokens } from "./tokenizer.js";
 
 const status = document.getElementById("status");
 
@@ -103,6 +104,11 @@ const status = document.getElementById("status");
         case "softmax": {
           const r = await softmax(device, model, new Float32Array(args.x), args.rows, args.n);
           return Array.from(r);
+        }
+        case "tokenizer_decode": {
+          // ids (array of int) → string. Loads tokenizer JSON on first call.
+          if (!window._tok) window._tok = await loadTokenizer();
+          return decodeTokens(window._tok, args.ids, { skipSpecial: !!args.skipSpecial });
         }
         case "greedy_generate": {
           // promptTokens (array of int), maxNew (int) → full token list.

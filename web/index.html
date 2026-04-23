@@ -2,36 +2,66 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>SuomiChat — WebGPU runtime (Phase 1)</title>
+<title>SuomiChat — WebGPU runtime</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
-  h1 { font-size: 1.4rem; }
-  pre { background: #f6f6f6; padding: 1rem; overflow: auto; font-size: 12px; }
+  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+  .subtitle { color: #666; margin-top: 0; font-size: 0.9rem; }
+  pre { background: #f6f6f6; padding: 0.75rem; overflow: auto; font-size: 12px; border-radius: 4px; }
   .ok { color: #228822; }
   .warn { color: #cc7700; }
   .err { color: #cc0000; }
-  button { padding: 0.5rem 1rem; cursor: pointer; }
-  #status { white-space: pre-line; }
+  button { padding: 0.5rem 1rem; cursor: pointer; font-size: 14px; }
+  button:disabled { cursor: not-allowed; opacity: 0.6; }
+  #status { white-space: pre-line; font-size: 13px; color: #333; min-height: 1em; }
+  #chat { margin-top: 1.5rem; padding: 1rem; border: 1px solid #ddd; border-radius: 6px; }
+  .msg { margin: 0.5rem 0; }
+  .msg.user { color: #335; font-weight: 500; }
+  .msg.assistant { color: #1a4; white-space: pre-wrap; }
+  .ctrl { display: flex; gap: 0.5rem; align-items: center; margin-top: 0.5rem; }
+  select { padding: 0.4rem; font-size: 14px; flex: 1; }
+  label { font-size: 13px; color: #555; }
 </style>
 </head>
 <body>
 
-<h1>SuomiChat — WebGPU runtime <small>Phase 1</small></h1>
-<p>
-  This page loads a suomichat checkpoint into your browser's GPU and
-  runs the very first operation in the forward pass: an embedding
-  lookup for a fixed token. Open the JS console for tensor dumps.
-</p>
+<h1>SuomiChat — d12 SFT runs entirely in your browser via WebGPU</h1>
+<p class="subtitle">Personal-learning runtime: 286M params, fp32, no quantisation. ~1.1 GB initial download.</p>
 
-<button id="run">Load and run</button>
-<div id="status">Click "Load and run" to start.</div>
-<pre id="output"></pre>
+<button id="boot">Load model</button>
+<div id="status">Click "Load model" to download weights and warm up GPU.</div>
+
+<div id="chat" hidden>
+  <div id="conversation"></div>
+  <div class="ctrl">
+    <label>Prompt:</label>
+    <select id="promptSel"></select>
+    <label>Tokens:</label>
+    <input id="maxNew" type="number" value="32" min="1" max="128" style="width:5em">
+    <button id="send" disabled>Generate</button>
+  </div>
+</div>
 
 <script type="module">
-import { initWebGPU, loadModel, embeddingLookup } from "./runtime.js";
+import { initWebGPU, loadModel, greedyGenerate } from "./runtime.js";
+import { loadTokenizer, decodeTokens } from "./tokenizer.js";
+
+// Pre-tokenized demo prompts (computed offline by suomichat tokenizer.render_for_completion).
+// To add more: cd web && SUOMICHAT_BASE_DIR=... python -c "..."
+const DEMO_PROMPTS = [
+  { label: "Moi! Kuka olet?",
+    ids: [32759, 32760, 27354, 33, 12733, 2140, 63, 32761, 32762] },
+  { label: "Mikä on Suomen pääkaupunki?",
+    ids: [32759, 32760, 31218, 8170, 25148, 4140, 13443, 70, 63, 32761, 32762] },
+];
 
 const statusEl = document.getElementById("status");
-const outEl = document.getElementById("output");
+const chatEl   = document.getElementById("chat");
+const convEl   = document.getElementById("conversation");
+const sendBtn  = document.getElementById("send");
+const bootBtn  = document.getElementById("boot");
+const sel      = document.getElementById("promptSel");
+const maxNewIn = document.getElementById("maxNew");
 
 function log(msg, cls) {
   const line = document.createElement("div");
@@ -41,38 +71,79 @@ function log(msg, cls) {
   console.log(msg);
 }
 
-document.getElementById("run").onclick = async () => {
+let device, model, tokenizer;
+
+bootBtn.onclick = async () => {
+  bootBtn.disabled = true;
   statusEl.textContent = "";
-  outEl.textContent = "";
-
   try {
-    log("1/4: initialising WebGPU…");
-    const { device } = await initWebGPU();
-    log(`     ✓ device ready (${device.label || "default adapter"})`, "ok");
+    log("1/4 init WebGPU…");
+    ({ device } = await initWebGPU());
+    log("    ✓ device ready", "ok");
 
-    log("2/4: fetching config + tensors manifest…");
-    const config = await (await fetch("./config.json")).json();
+    log("2/4 fetch config + tensor manifest…");
+    const cfg = await (await fetch("./config.json")).json();
     const manifest = await (await fetch("./tensors.json")).json();
-    log(`     ✓ d${config.n_layer}, vocab=${config.vocab_size}, n_embd=${config.n_embd}`, "ok");
-    log(`     ✓ ${Object.keys(manifest.tensors).length} tensors, ${(manifest.total_size / 1024**2).toFixed(1)} MB`);
+    log(`    ✓ d${cfg.n_layer}  vocab=${cfg.vocab_size}  n_embd=${cfg.n_embd}`, "ok");
 
-    log("3/4: streaming weights.bin to GPU (this is the big download)…");
+    log(`3/4 streaming ${(manifest.total_size / 1024**2).toFixed(0)} MB of weights to GPU…`);
     const t0 = performance.now();
-    const model = await loadModel(device, config, manifest, "./weights.bin");
-    const dt = ((performance.now() - t0) / 1000).toFixed(1);
-    log(`     ✓ loaded in ${dt}s`, "ok");
+    model = await loadModel(device, cfg, manifest, "./weights.bin");
+    log(`    ✓ loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s`, "ok");
 
-    log("4/4: running embedding lookup for token id 100…");
-    const tokenId = 100;
-    const embedding = await embeddingLookup(device, model, tokenId);
-    log(`     ✓ embedding[${tokenId}] shape: [${embedding.length}]`, "ok");
-    outEl.textContent =
-      `embedding[${tokenId}] first 16 values:\n  ` +
-      Array.from(embedding.slice(0, 16)).map(v => v.toFixed(4)).join(", ") +
-      `\n\nrun verify.py to compare against PyTorch.`;
+    log("4/4 loading tokenizer JSON…");
+    tokenizer = await loadTokenizer();
+    log(`    ✓ vocab=${tokenizer.nVocab}, ${Object.keys(tokenizer.specialTokens).length} special tokens`, "ok");
+
+    for (const p of DEMO_PROMPTS) {
+      const opt = document.createElement("option");
+      opt.value = p.ids.join(",");
+      opt.textContent = p.label;
+      sel.appendChild(opt);
+    }
+    chatEl.hidden = false;
+    sendBtn.disabled = false;
+    log("Ready. Pick a prompt below.", "ok");
   } catch (e) {
     log("FAILED: " + (e.message || e), "err");
     console.error(e);
+    bootBtn.disabled = false;
+  }
+};
+
+sendBtn.onclick = async () => {
+  sendBtn.disabled = true;
+  const promptIds = sel.value.split(",").map(Number);
+  const promptText = sel.options[sel.selectedIndex].textContent;
+  const maxNew = Math.max(1, Math.min(128, parseInt(maxNewIn.value, 10) || 32));
+
+  const userDiv = document.createElement("div");
+  userDiv.className = "msg user";
+  userDiv.textContent = "User: " + promptText;
+  convEl.appendChild(userDiv);
+
+  const aDiv = document.createElement("div");
+  aDiv.className = "msg assistant";
+  aDiv.textContent = "Assistant (generating " + maxNew + " tokens, ~" + maxNew + "s)…";
+  convEl.appendChild(aDiv);
+
+  try {
+    const t0 = performance.now();
+    const all = await greedyGenerate(device, model, promptIds, maxNew, promptIds.length + maxNew + 4);
+    const dt = ((performance.now() - t0) / 1000).toFixed(1);
+    const generatedIds = all.slice(promptIds.length);
+    // Stop at assistant_end if present
+    const endId = tokenizer.specialTokens["<|assistant_end|>"];
+    let cut = generatedIds.indexOf(endId);
+    if (cut === -1) cut = generatedIds.length;
+    const text = decodeTokens(tokenizer, generatedIds.slice(0, cut), { skipSpecial: true });
+    aDiv.textContent = "Assistant: " + text + "\n\n[" + cut + " tokens in " + dt + "s]";
+  } catch (e) {
+    aDiv.textContent = "FAILED: " + (e.message || e);
+    aDiv.className = "msg err";
+    console.error(e);
+  } finally {
+    sendBtn.disabled = false;
   }
 };
 </script>
