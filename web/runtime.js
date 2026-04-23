@@ -717,6 +717,46 @@ export async function forward(device, model, tokenId, cache = null) {
 }
 
 // ---------------------------------------------------------------------
+// Greedy generation: prefill prompt, then sample argmax `maxNew` times.
+// Returns full token sequence (prompt + generated). Temperature 0.
+//
+// Each step is an independent forward(token, cache) call — the cache
+// carries K/V across positions, smear fires from step 2+. We argmax
+// in JS (logits already on the CPU); a one-element argmax shader would
+// add complexity for no gain at d12 vocab=64K.
+// ---------------------------------------------------------------------
+function _argmax(arr) {
+  let best = 0, bv = arr[0];
+  for (let i = 1; i < arr.length; i++) {
+    if (arr[i] > bv) { bv = arr[i]; best = i; }
+  }
+  return best;
+}
+
+export async function greedyGenerate(device, model, promptTokens, maxNew, maxSeqLen = null) {
+  if (!Array.isArray(promptTokens) || promptTokens.length === 0) {
+    throw new Error("greedyGenerate: promptTokens must be a non-empty array");
+  }
+  const total = promptTokens.length + maxNew;
+  const cache = initKVCache(device, model, maxSeqLen ?? total);
+
+  let lastLogits = null;
+  for (const tok of promptTokens) {
+    lastLogits = await forward(device, model, tok, cache);
+  }
+
+  const out = promptTokens.slice();
+  for (let i = 0; i < maxNew; i++) {
+    const next = _argmax(lastLogits);
+    out.push(next);
+    if (i < maxNew - 1) lastLogits = await forward(device, model, next, cache);
+  }
+
+  destroyKVCache(cache);
+  return out;
+}
+
+// ---------------------------------------------------------------------
 // Full transformer block (one layer). Mirrors the outer loop in
 // GPT.forward(), which does:
 //   x = resid_lambdas[i] * x + x0_lambdas[i] * x0

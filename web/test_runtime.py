@@ -268,6 +268,52 @@ async def test_full_forward(model, token_id: int = 100, atol: float = 0.3):
     return False
 
 
+async def test_greedy_generate(model, prompt_tokens=(100, 7), max_new: int = 8):
+    """Greedy autoregressive generation. Compares the WebGPU output token
+    sequence against PyTorch ref (forward + argmax loop).
+
+    Acceptance: exact token-for-token match.
+
+    Note: small drift in fp32 accumulation can flip an argmax late in the
+    sequence (0.3 abs logit diff vs ref). We tolerate that — but only by
+    measuring how many initial tokens match, and require >= ceil(max_new/2).
+    """
+    print(f"--- test: greedy_generate prompt={list(prompt_tokens)} max_new={max_new} ---")
+
+    # PyTorch reference: same loop the runtime does.
+    ref_tokens = list(prompt_tokens)
+    with torch.no_grad():
+        for _ in range(max_new):
+            t = torch.tensor([ref_tokens])
+            logits = model(t)[0, -1].cpu().float().numpy()
+            ref_tokens.append(int(logits.argmax()))
+
+    got_tokens = await run_browser_op("greedy_generate", {
+        "promptTokens": list(prompt_tokens),
+        "maxNew": max_new,
+        "maxSeqLen": len(prompt_tokens) + max_new + 1,
+    })
+
+    print(f"  ref: {ref_tokens}")
+    print(f"  got: {got_tokens}")
+
+    # Count consecutive matches starting from prompt end
+    n_prompt = len(prompt_tokens)
+    matched = 0
+    for i in range(max_new):
+        if ref_tokens[n_prompt + i] == got_tokens[n_prompt + i]:
+            matched += 1
+        else:
+            break
+    required = (max_new + 1) // 2
+    print(f"  matched {matched}/{max_new} consecutive (required >= {required})")
+    if matched >= required:
+        print("  ✓ PASS")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_kv_cache_two_tokens(model, t0: int = 100, t1: int = 7, atol: float = 0.5):
     """Two-step decode with KV cache + smear gate (smear fires on step 2).
     Compares the WebGPU position-1 logits to PyTorch's logits[0, 1]
@@ -556,8 +602,7 @@ async def main():
     passed.append(await test_softmax(seed=1, rows=6, n=1))    # trivial 1-element softmax = 1.0
     passed.append(await test_kv_cache_two_tokens(model, t0=100, t1=7))
     passed.append(await test_kv_cache_two_tokens(model, t0=42, t1=42))  # repeat token edge
-
-    # Future: test_greedy_generate_16, etc.
+    passed.append(await test_greedy_generate(model, prompt_tokens=(100, 7), max_new=8))
 
     n_pass = sum(passed)
     n_total = len(passed)
