@@ -423,6 +423,88 @@ export async function ropeApply(device, model, x, N, D, T0 = 0) {
 }
 
 // ---------------------------------------------------------------------
+// Attention block for one transformer layer, T=1, no KV cache.
+//
+// For T=1 and no cache, the attention mechanism trivialises: there is
+// exactly one key/value and one query. softmax of a single score = 1.0,
+// so attn_output equals V unchanged. We still compute Q/K projections
+// and apply RoPE + QK norm + scaling so that later phases (with proper
+// SDPA over a KV cache) can reuse this scaffolding directly.
+//
+// This phase doesn't test softmax numerics — that's Phase 11's job.
+// What it DOES validate: Q/K/V projections, head-wise RoPE, head-wise
+// QK norm, per-layer value embedding hookup (Phase 7), c_proj chain.
+// ---------------------------------------------------------------------
+export async function attentionBlock(device, model, layerIdx, x, T0 = 0, ve = null) {
+  const prefix = `transformer.h.${layerIdx}.attn`;
+  const cfg = model.config;
+  const n_embd = cfg.n_embd;
+  const n_head = cfg.n_head;
+  const n_kv = cfg.n_kv_head;
+  const head_dim = n_embd / n_head;
+  const M = x.length / n_embd;   // batch*time rows; for now = 1
+
+  // 1. Q, K, V projections
+  const q = await linear(device, model, x, M, n_embd, `${prefix}.c_q.weight`);
+  const k = await linear(device, model, x, M, n_embd, `${prefix}.c_k.weight`);
+  let   v = await linear(device, model, x, M, n_embd, `${prefix}.c_v.weight`);
+
+  // 2. Value residual (ResFormer). Added in Phase 7.
+  //    if ve !== null: v = v + gate * ve, where gate = 3 * sigmoid(ve_gate(x[..., :12]))
+  if (ve !== null) {
+    // ve_gate weight shape: (n_kv, 12). Input is first 12 elements of x per row.
+    const xHead = x.slice(0, M * 12);   // contiguous for M=1
+    const gateRaw = await linear(device, model, xHead, M, 12, `${prefix}.ve_gate.weight`);
+    const gateSig = await sigmoid(device, model, gateRaw);
+    const gateTriple = await scalarMul(device, model, gateSig, 3.0);
+    // gateTriple has shape (M, n_kv). Broadcast across head_dim against ve and v.
+    // v shape (M, n_kv, head_dim) flat. For each (m, h), scale ve[m,h,:] by gateTriple[m,h]
+    // Use a tiny helper: expand gateTriple to match v's shape, then element-wise mul.
+    const gateExpanded = new Float32Array(v.length);
+    for (let m = 0; m < M; m++) {
+      for (let h = 0; h < n_kv; h++) {
+        const g = gateTriple[m * n_kv + h];
+        for (let d = 0; d < head_dim; d++) {
+          gateExpanded[m * n_kv * head_dim + h * head_dim + d] = g;
+        }
+      }
+    }
+    const veScaled = await mul(device, model, gateExpanded, ve);
+    v = await add(device, model, v, veScaled);
+  }
+
+  // 3. RoPE on Q, K (in-place logically; ropeApply returns new array)
+  const qR = await ropeApply(device, model, q, n_head, head_dim, T0);
+  const kR = await ropeApply(device, model, k, n_kv, head_dim, T0);
+
+  // 4. QK norm: rmsnorm each head's (head_dim,) vector separately
+  const qN = new Float32Array(qR.length);
+  const kN = new Float32Array(kR.length);
+  for (let h = 0; h < n_head; h++) {
+    const row = qR.slice(h * head_dim, (h + 1) * head_dim);
+    qN.set(await rmsnorm(device, model, row), h * head_dim);
+  }
+  for (let h = 0; h < n_kv; h++) {
+    const row = kR.slice(h * head_dim, (h + 1) * head_dim);
+    kN.set(await rmsnorm(device, model, row), h * head_dim);
+  }
+
+  // 5. Scale by 1.2
+  const qS = await scalarMul(device, model, qN, 1.2);
+  const kS = await scalarMul(device, model, kN, 1.2);
+
+  // 6. SDPA for T=1: output = v (softmax over single key = 1.0).
+  //    Phase 11 will replace this with a proper softmax + matmul chain.
+  //    qS and kS are computed but intentionally unused here — they'll
+  //    participate once we have T_k > 1.
+  void qS; void kS;
+  const attnOut = v;   // shape (M, n_head * head_dim)
+
+  // 7. c_proj
+  return await linear(device, model, attnOut, M, n_embd, `${prefix}.c_proj.weight`);
+}
+
+// ---------------------------------------------------------------------
 // MLP block for one transformer layer.
 //   y = c_proj(relu²(c_fc(x)))
 // ---------------------------------------------------------------------

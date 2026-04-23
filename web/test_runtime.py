@@ -207,6 +207,57 @@ async def test_elementwise(seed: int = 0, n: int = 768):
     return all(results)
 
 
+async def test_attention_block(model, layer_idx: int = 0, seed: int = 0, atol: float = 5e-4):
+    """Verify attentionBlock against model.transformer.h[i].attn() for T=1."""
+    from suomichat.gpt import has_ve
+    print(f"--- test: attention_block layer {layer_idx} ---")
+    g = torch.Generator().manual_seed(seed)
+    n_embd = model.config.n_embd
+    n_layer = model.config.n_layer
+    head_dim = n_embd // model.config.n_head
+
+    x = torch.randn(1, 1, n_embd, dtype=torch.float32, generator=g)
+    T0 = 0
+    cos = model.cos[:, T0:T0+1]
+    sin = model.sin[:, T0:T0+1]
+
+    # value embedding path (Phase 7): active on alternating layers
+    layer_has_ve = has_ve(layer_idx, n_layer)
+    if layer_has_ve:
+        fake_token = torch.tensor([[0]])  # any token id; just need the shape
+        ve_tensor = model.value_embeds[str(layer_idx)](fake_token)  # (1, 1, n_kv_head*head_dim)
+        ve_arg = ve_tensor.flatten().tolist()
+    else:
+        ve_tensor = None
+        ve_arg = None
+
+    # Window size: full context for our Phase 6 (we bypass sliding window)
+    with torch.no_grad():
+        ref = model.transformer.h[layer_idx].attn(
+            x, ve_tensor, (cos, sin), (-1, 0), None
+        ).cpu().float().numpy()
+
+    got = await run_browser_op("attention", {
+        "x": x.flatten().tolist(),
+        "layerIdx": layer_idx,
+        "T0": T0,
+        "ve": ve_arg,
+    })
+    got = torch.tensor(got, dtype=torch.float32).view(ref.shape).numpy()
+
+    diff = abs(ref - got).max()
+    rel = diff / (abs(ref).max() + 1e-12)
+    print(f"  max abs diff: {diff:.3e}  rel: {rel:.3e}  (tol {atol:.0e})")
+    print(f"  has_ve: {layer_has_ve}")
+    if diff <= atol:
+        print("  ✓ PASS")
+        return True
+    print(f"  ref[0, 0, :6]: {ref[0, 0, :6]}")
+    print(f"  got[0, 0, :6]: {got[0, 0, :6]}")
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_mlp_block(model, layer_idx: int = 0, seed: int = 0, atol: float = 5e-4):
     """Verify our mlpBlock against model.transformer.h[i].mlp on a random x."""
     print(f"--- test: mlp_block layer {layer_idx} ---")
@@ -342,8 +393,10 @@ async def main():
     passed.append(await test_linear(model, "transformer.h.0.mlp.c_fc.weight"))  # (3072, 768) d12: 4*n_embd
     passed.append(await test_mlp_block(model, layer_idx=0))
     passed.append(await test_mlp_block(model, layer_idx=6))                     # mid-stack sanity
+    passed.append(await test_attention_block(model, layer_idx=0))               # no value embeds
+    passed.append(await test_attention_block(model, layer_idx=1))               # has value embeds
 
-    # Future: test_attention, test_full_forward, etc.
+    # Future: test_full_forward, etc.
 
     n_pass = sum(passed)
     n_total = len(passed)
