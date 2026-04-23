@@ -193,8 +193,13 @@ export async function downloadTensor(device, t) {
 // Return a tensor's buffer to the pool. After this the tensor must not
 // be used again. Safe on non-pooled tensors (no-op).
 export function releaseTensor(model, t) {
+  if (POOL_DEBUG_NO_RELEASE) return;
   if (t && t._pooled) _ensurePool(model).release(t.buffer);
 }
+
+// DEBUG: set true to make releaseTensor a no-op (each tensor gets a
+// fresh buffer; pool only grows). Use to isolate pool-reuse races.
+export const POOL_DEBUG_NO_RELEASE = false;
 
 // ---------------------------------------------------------------------
 // 4b. Legacy: turn a Float32Array into a one-shot STORAGE GPUBuffer.
@@ -220,7 +225,8 @@ const UNIFORM_USAGE = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
 function _writeUniforms(device, model, u32s, f32Pairs = []) {
   // u32s: array of u32 values starting at offset 0.
   // f32Pairs: array of [byteOffset, f32Value] for f32 fields mixed in.
-  const minSize = Math.max(16, u32s.length * 4);
+  let minSize = Math.max(16, u32s.length * 4);
+  for (const [off] of f32Pairs) minSize = Math.max(minSize, off + 4);
   const size = (minSize + 15) & ~15;
   const buf = _ensurePool(model).acquire(device, size, UNIFORM_USAGE, "uniforms");
   const ab = new ArrayBuffer(size);
@@ -256,12 +262,19 @@ function _dispatch(device, pipeline, bufferBindings, uniformsBuf, dispatch) {
 // thin wrappers over these.
 // ---------------------------------------------------------------------
 
-export async function rmsnormT(device, model, x, eps = 1e-5) {
-  const n = x.shape[x.shape.length - 1];
+// RMSNorm. x shape (..., n). Each row of length `n` is normalised
+// independently. Defaults: `n` = x.shape[-1], `rows` = numel / n.
+// Both can be overridden — useful for per-head QK norm where the
+// tensor is laid out as (n_head * head_dim) flat and you want each
+// head's `head_dim` slice normalized separately.
+export async function rmsnormT(device, model, x, eps = 1e-5, rowsOverride = null, nOverride = null) {
+  const n = nOverride ?? x.shape[x.shape.length - 1];
+  const numel = x.byteLength / 4;
+  const rows = rowsOverride ?? (numel / n);
   const pipeline = await getPipeline(device, model, "rmsnorm");
   const y = allocTensor(device, model, x.shape, "rmsnorm_y");
   const u = _writeUniforms(device, model, [n], [[4, eps]]);
-  _dispatch(device, pipeline, [x.buffer, y.buffer], u, [1]);   // single row, single workgroup
+  _dispatch(device, pipeline, [x.buffer, y.buffer], u, [rows]);
   _ensurePool(model).release(u);
   return y;
 }
@@ -294,11 +307,14 @@ export const relu2T     = (d, m, a)            => _elemUnaryT (d, m, "relu2", a)
 export const sigmoidT   = (d, m, a)            => _elemUnaryT (d, m, "sigmoid", a);
 export const softcapT   = (d, m, a, cap = 15)  => _elemUnaryT (d, m, "softcap", a, cap);
 
-// RoPE on Tensor x of shape (N, D). T0 = position offset into cos/sin.
-export async function ropeApplyT(device, model, x, T0 = 0) {
-  const D = x.shape[x.shape.length - 1];
+// RoPE on Tensor x. The shader treats x as (N, D) where D = head_dim
+// (NOT n_embd). When x is laid out flat as (n_head*head_dim,) you MUST
+// pass headDim explicitly so the rotation operates per-head.
+export async function ropeApplyT(device, model, x, T0 = 0, headDim = null) {
+  const D = headDim ?? x.shape[x.shape.length - 1];
   if (D % 2 !== 0) throw new Error("ropeT: D must be even");
-  const N = x.shape.length === 1 ? 1 : x.shape[0];
+  const numel = x.byteLength / 4;
+  const N = numel / D;
   const d = D / 2;
   const pipeline = await getPipeline(device, model, "rope");
   const cos = model.tensors.get("cos"), sin = model.tensors.get("sin");
@@ -339,8 +355,11 @@ export async function linearT(device, model, x, weightName) {
   if (!w) throw new Error(`linearT: ${weightName} missing`);
   const [N, K] = w.shape;
   const M = x.shape.length === 1 ? 1 : x.shape[0];
-  if (x.shape[x.shape.length - 1] !== K) {
-    throw new Error(`linearT shape mismatch: x last-dim ${x.shape[x.shape.length - 1]} vs weight K=${K}`);
+  // We allow x's last-dim to be ≥ K — the linear shader indexes x[m*K + k]
+  // and reads only the first K elements per row. ve_gate / smear_gate use
+  // this to consume a prefix of n_embd without an explicit slice.
+  if (x.shape[x.shape.length - 1] < K) {
+    throw new Error(`linearT: x last-dim ${x.shape[x.shape.length - 1]} < weight K=${K}`);
   }
   const pipeline = await getPipeline(device, model, "linear");
   const y = allocTensor(device, model, [M, N], "linear_y");
@@ -720,27 +739,50 @@ async function ensureScalars(device, model) {
   model.x0Lambdas    = await downloadF32(device, model.tensors.get("x0_lambdas").buffer,    n * 4);
 }
 
-export async function transformerBlock(device, model, layerIdx, x, x0, T0 = 0, ve = null, cache = null) {
+// transformerBlockT — Tensor in/out. Mirrors PyTorch GPT.forward inner loop:
+//   x = resid_lambdas[i]*x + x0_lambdas[i]*x0
+//   x = x + attn(norm(x))
+//   x = x + mlp(norm(x))
+export async function transformerBlockT(device, model, layerIdx, x, x0, T0 = 0, ve = null, cache = null) {
   await ensureScalars(device, model);
   const residL = model.residLambdas[layerIdx];
   const x0L    = model.x0Lambdas[layerIdx];
 
   // 1. Per-layer residual mix
-  const resid = await scalarMul(device, model, x, residL);
-  const x0m   = await scalarMul(device, model, x0, x0L);
-  let   cur   = await add(device, model, resid, x0m);
+  const resid = await scalarMulT(device, model, x,  residL);
+  const x0m   = await scalarMulT(device, model, x0, x0L);
+  let   cur   = await addT       (device, model, resid, x0m);
+  releaseTensor(model, resid); releaseTensor(model, x0m);
 
   // 2. Attention + residual
-  const xn    = await rmsnorm(device, model, cur);
-  const ao    = await attentionBlock(device, model, layerIdx, xn, T0, ve, cache);
-  cur         = await add(device, model, cur, ao);
+  const xn = await rmsnormT(device, model, cur);
+  const ao = await attentionBlockT(device, model, layerIdx, xn, T0, ve, cache);
+  releaseTensor(model, xn);
+  const cur2 = await addT(device, model, cur, ao);
+  releaseTensor(model, cur); releaseTensor(model, ao);
+  cur = cur2;
 
   // 3. MLP + residual
-  const xn2   = await rmsnorm(device, model, cur);
-  const mo    = await mlpBlock(device, model, layerIdx, xn2);
-  cur         = await add(device, model, cur, mo);
+  const xn2 = await rmsnormT(device, model, cur);
+  const mo  = await mlpBlockT(device, model, layerIdx, xn2);
+  releaseTensor(model, xn2);
+  const cur3 = await addT(device, model, cur, mo);
+  releaseTensor(model, cur); releaseTensor(model, mo);
+  return cur3;
+}
 
-  return cur;
+export async function transformerBlock(device, model, layerIdx, x, x0, T0 = 0, ve = null, cache = null) {
+  const n_embd = model.config.n_embd;
+  const M = x.length / n_embd;
+  const xT  = uploadTensor(device, model, x,  [M, n_embd], "tb_x");
+  const x0T = uploadTensor(device, model, x0, [M, n_embd], "tb_x0");
+  const veT = ve ? uploadTensor(device, model, ve, [M, model.config.n_kv_head * (n_embd / model.config.n_head)], "tb_ve") : null;
+  const yT  = await transformerBlockT(device, model, layerIdx, xT, x0T, T0, veT, cache);
+  const out = await downloadTensor(device, yT);
+  releaseTensor(model, xT); releaseTensor(model, x0T);
+  if (veT) releaseTensor(model, veT);
+  releaseTensor(model, yT);
+  return out;
 }
 
 // ---------------------------------------------------------------------
@@ -756,114 +798,145 @@ export async function transformerBlock(device, model, layerIdx, x, x0, T0 = 0, v
 // What it DOES validate: Q/K/V projections, head-wise RoPE, head-wise
 // QK norm, per-layer value embedding hookup (Phase 7), c_proj chain.
 // ---------------------------------------------------------------------
-export async function attentionBlock(device, model, layerIdx, x, T0 = 0, ve = null, cache = null) {
+// ---------------------------------------------------------------------
+// Attention block (Tensor in/out). Single-token (M=1) inference.
+// Mirrors PyTorch GPT.attention: c_q/c_k/c_v projections → ve gate
+// (optional) → RoPE → per-head QK rmsnorm → scale → SDPA → c_proj.
+//
+// For M=1 with no cache: SDPA trivialises (one query, one key) so the
+// output equals V. With cache: append (K, V) to per-layer cache buffers
+// then run sdpa_scores → softmax → sdpa_output over the full T_k.
+// ---------------------------------------------------------------------
+export async function attentionBlockT(device, model, layerIdx, x, T0 = 0, ve = null, cache = null) {
   const prefix = `transformer.h.${layerIdx}.attn`;
   const cfg = model.config;
-  const n_embd = cfg.n_embd;
-  const n_head = cfg.n_head;
-  const n_kv = cfg.n_kv_head;
-  const head_dim = n_embd / n_head;
-  const M = x.length / n_embd;   // batch*time rows; for now = 1
+  const n_head   = cfg.n_head;
+  const n_kv     = cfg.n_kv_head;
+  const head_dim = cfg.n_embd / n_head;
 
   // 1. Q, K, V projections
-  const q = await linear(device, model, x, M, n_embd, `${prefix}.c_q.weight`);
-  const k = await linear(device, model, x, M, n_embd, `${prefix}.c_k.weight`);
-  let   v = await linear(device, model, x, M, n_embd, `${prefix}.c_v.weight`);
+  const q = await linearT(device, model, x, `${prefix}.c_q.weight`);
+  const k = await linearT(device, model, x, `${prefix}.c_k.weight`);
+  let   v = await linearT(device, model, x, `${prefix}.c_v.weight`);
 
-  // 2. Value residual (ResFormer). Added in Phase 7.
-  //    if ve !== null: v = v + gate * ve, where gate = 3 * sigmoid(ve_gate(x[..., :12]))
+  // 2. Value residual: v += 3 * sigmoid(ve_gate(x[..,:12])) * ve   (only if ve provided)
+  //    ve_gate weight shape (n_kv, 12) — linearT reads only first 12 elements of x.
   if (ve !== null) {
-    // ve_gate weight shape: (n_kv, 12). Input is first 12 elements of x per row.
-    const xHead = x.slice(0, M * 12);   // contiguous for M=1
-    const gateRaw = await linear(device, model, xHead, M, 12, `${prefix}.ve_gate.weight`);
-    const gateSig = await sigmoid(device, model, gateRaw);
-    const gateTriple = await scalarMul(device, model, gateSig, 3.0);
-    // gateTriple has shape (M, n_kv). Broadcast across head_dim against ve and v.
-    // v shape (M, n_kv, head_dim) flat. For each (m, h), scale ve[m,h,:] by gateTriple[m,h]
-    // Use a tiny helper: expand gateTriple to match v's shape, then element-wise mul.
-    const gateExpanded = new Float32Array(v.length);
-    for (let m = 0; m < M; m++) {
-      for (let h = 0; h < n_kv; h++) {
-        const g = gateTriple[m * n_kv + h];
-        for (let d = 0; d < head_dim; d++) {
-          gateExpanded[m * n_kv * head_dim + h * head_dim + d] = g;
-        }
-      }
-    }
-    const veScaled = await mul(device, model, gateExpanded, ve);
-    v = await add(device, model, v, veScaled);
+    const gateRaw    = await linearT  (device, model, x, `${prefix}.ve_gate.weight`);
+    const gateSig    = await sigmoidT (device, model, gateRaw);    releaseTensor(model, gateRaw);
+    const gateTriple = await scalarMulT(device, model, gateSig, 3.0); releaseTensor(model, gateSig);
+    await veApplyT(device, model, gateTriple, ve, v, head_dim);   // v += gateTriple[h] * ve[i]
+    releaseTensor(model, gateTriple);
   }
 
-  // 3. RoPE on Q, K (in-place logically; ropeApply returns new array)
-  const qR = await ropeApply(device, model, q, n_head, head_dim, T0);
-  const kR = await ropeApply(device, model, k, n_kv, head_dim, T0);
+  // 3. RoPE on Q, K — pass head_dim explicitly so rotation is per-head.
+  const qR = await ropeApplyT(device, model, q, T0, head_dim); releaseTensor(model, q);
+  const kR = await ropeApplyT(device, model, k, T0, head_dim); releaseTensor(model, k);
 
-  // 4. QK norm: rmsnorm each head's (head_dim,) vector separately
-  const qN = new Float32Array(qR.length);
-  const kN = new Float32Array(kR.length);
-  for (let h = 0; h < n_head; h++) {
-    const row = qR.slice(h * head_dim, (h + 1) * head_dim);
-    qN.set(await rmsnorm(device, model, row), h * head_dim);
-  }
-  for (let h = 0; h < n_kv; h++) {
-    const row = kR.slice(h * head_dim, (h + 1) * head_dim);
-    kN.set(await rmsnorm(device, model, row), h * head_dim);
-  }
+  // 4. QK norm: per-head rmsnorm. qR/kR are flat (1, n_head*head_dim)
+  //    but we want each `head_dim`-long slice normalised independently,
+  //    so pass nOverride=head_dim and rowsOverride=n_head.
+  const qN = await rmsnormT(device, model, qR, 1e-5, n_head, head_dim); releaseTensor(model, qR);
+  const kN = await rmsnormT(device, model, kR, 1e-5, n_kv,   head_dim); releaseTensor(model, kR);
 
-  // 5. Scale by 1.2
-  const qS = await scalarMul(device, model, qN, 1.2);
-  const kS = await scalarMul(device, model, kN, 1.2);
+  // 5. Scale by 1.2 (suomichat-specific QK scale, atop 1/sqrt(hd) inside SDPA)
+  const qS = await scalarMulT(device, model, qN, 1.2); releaseTensor(model, qN);
+  const kS = await scalarMulT(device, model, kN, 1.2); releaseTensor(model, kN);
 
-  // 6. SDPA.
-  //    Without cache (Phase 6 original path): T=1 → output = v.
-  //    With cache: append new K/V at cache.seqlens, then run SDPA over [0..seqlens+1].
-  let attnOut;
+  // 6. SDPA
+  let attnT;
   if (cache === null) {
-    attnOut = v;
+    attnT = v; v = null;   // T=1, no cache: trivial — output = v
   } else {
-    // Append current k, v to cache at position cache.seqlens
     const kvDim = n_kv * head_dim;
     const writeOffset = cache.seqlens * kvDim * 4;
-    device.queue.writeBuffer(cache.kBuffers[layerIdx], writeOffset, kS.buffer, kS.byteOffset, kS.byteLength);
-    device.queue.writeBuffer(cache.vBuffers[layerIdx], writeOffset, v.buffer,  v.byteOffset,  v.byteLength);
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(kS.buffer, 0, cache.kBuffers[layerIdx], writeOffset, kvDim * 4);
+    enc.copyBufferToBuffer(v.buffer,  0, cache.vBuffers[layerIdx], writeOffset, kvDim * 4);
+    device.queue.submit([enc.finish()]);
     const Tk = cache.seqlens + 1;
 
-    // Allocate scratch buffers for this step
-    const qBuf    = uploadF32(device, "sdpa_q", qS);
-    const scBuf   = device.createBuffer({
-      size: n_head * Tk * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
-    });
-    const outBuf  = device.createBuffer({
-      size: n_head * head_dim * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-    });
-
-    await sdpaScoresGPU (device, model, qBuf, cache.kBuffers[layerIdx], scBuf, n_head, n_kv, head_dim, Tk);
-    await softmaxRowsGPU(device, model, scBuf, n_head, Tk);
-    await sdpaOutputGPU (device, model, scBuf, cache.vBuffers[layerIdx], outBuf, n_head, n_kv, head_dim, Tk);
-
-    attnOut = await downloadF32(device, outBuf, n_head * head_dim * 4);
-    qBuf.destroy(); scBuf.destroy(); outBuf.destroy();
+    // sdpa_scores: (n_head, Tk)
+    const scoresT = allocTensor(device, model, [n_head, Tk], "sdpa_scores");
+    {
+      const pipeline = await getPipeline(device, model, "sdpa_scores");
+      const u = _writeUniforms(device, model,
+        [n_head, n_kv, head_dim, Tk],
+        [[16, 1.0 / Math.sqrt(head_dim)]]);
+      _dispatch(device, pipeline,
+        [qS.buffer, cache.kBuffers[layerIdx], scoresT.buffer],
+        u, [Math.ceil(n_head / 8), Math.ceil(Tk / 8)]);
+      _ensurePool(model).release(u);
+    }
+    // softmax rows
+    const attnW = await softmaxT(device, model, scoresT, n_head, Tk);
+    releaseTensor(model, scoresT);
+    // sdpa_output: (n_head, head_dim)
+    attnT = allocTensor(device, model, [1, n_head * head_dim], "sdpa_out");
+    {
+      const pipeline = await getPipeline(device, model, "sdpa_output");
+      const u = _writeUniforms(device, model, [n_head, n_kv, head_dim, Tk]);
+      _dispatch(device, pipeline,
+        [attnW.buffer, cache.vBuffers[layerIdx], attnT.buffer],
+        u, [Math.ceil(n_head / 8), Math.ceil(head_dim / 8)]);
+      _ensurePool(model).release(u);
+    }
+    releaseTensor(model, attnW);
+    releaseTensor(model, v);
   }
+  releaseTensor(model, kS);
 
   // 7. c_proj
-  return await linear(device, model, attnOut, M, n_embd, `${prefix}.c_proj.weight`);
+  const out = await linearT(device, model, attnT, `${prefix}.c_proj.weight`);
+  releaseTensor(model, attnT);
+  return out;
+}
+
+export async function attentionBlock(device, model, layerIdx, x, T0 = 0, ve = null, cache = null) {
+  const n_embd = model.config.n_embd;
+  const M = x.length / n_embd;
+  const xT = uploadTensor(device, model, x, [M, n_embd], "attn_x");
+  const veT = ve ? uploadTensor(device, model, ve, [M, model.config.n_kv_head * (n_embd / model.config.n_head)], "attn_ve") : null;
+  const yT = await attentionBlockT(device, model, layerIdx, xT, T0, veT, cache);
+  const out = await downloadTensor(device, yT);
+  releaseTensor(model, xT);
+  if (veT) releaseTensor(model, veT);
+  releaseTensor(model, yT);
+  return out;
 }
 
 // ---------------------------------------------------------------------
-// MLP block for one transformer layer.
-//   y = c_proj(relu²(c_fc(x)))
+// MLP block (Tensor in/out): y = c_proj(relu²(c_fc(x)))
 // ---------------------------------------------------------------------
-export async function mlpBlock(device, model, layerIdx, x) {
+export async function mlpBlockT(device, model, layerIdx, x) {
   const prefix = `transformer.h.${layerIdx}.mlp`;
-  const n_embd = model.config.n_embd;
-  const hidden = 4 * n_embd;           // c_fc expands by 4×
-  const M = x.length / n_embd;         // batch*time rows
-  const h = await linear(device, model, x, M, n_embd, `${prefix}.c_fc.weight`);
-  const a = await relu2(device, model, h);
-  const y = await linear(device, model, a, M, hidden, `${prefix}.c_proj.weight`);
+  const h = await linearT(device, model, x, `${prefix}.c_fc.weight`);
+  const a = await relu2T(device, model, h);
+  releaseTensor(model, h);
+  const y = await linearT(device, model, a, `${prefix}.c_proj.weight`);
+  releaseTensor(model, a);
   return y;
+}
+
+export async function mlpBlock(device, model, layerIdx, x) {
+  const n_embd = model.config.n_embd;
+  const M = x.length / n_embd;
+  const xT = uploadTensor(device, model, x, [M, n_embd], "mlp_x");
+  const yT = await mlpBlockT(device, model, layerIdx, xT);
+  const out = await downloadTensor(device, yT);
+  releaseTensor(model, xT); releaseTensor(model, yT);
+  return out;
+}
+
+// ---------------------------------------------------------------------
+// VE-apply: v[i] += gate[h] * ve[i] in place. Runs the ve_apply shader.
+// ---------------------------------------------------------------------
+async function veApplyT(device, model, gate, ve, v, head_dim) {
+  const numel = v.byteLength / 4;
+  const pipeline = await getPipeline(device, model, "ve_apply");
+  const u = _writeUniforms(device, model, [numel, head_dim]);
+  _dispatch(device, pipeline, [gate.buffer, ve.buffer, v.buffer], u, [Math.ceil(numel / 64)]);
+  _ensurePool(model).release(u);
 }
 
 export const add       = (d, m, a, b)     => _binWrap(d, m, "add", a, b);
