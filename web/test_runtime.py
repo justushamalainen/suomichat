@@ -43,6 +43,11 @@ def ref_embedding(model, token_id: int):
     return model.transformer.wte.weight[token_id].detach().cpu().float()
 
 
+def ref_rmsnorm(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """PyTorch reference for RMSNorm (no learnable weight, last-dim normalised)."""
+    return torch.nn.functional.rms_norm(x, (x.size(-1),), eps=eps)
+
+
 # ----------------------------------------------------------------------
 # Headless Chrome driver
 # ----------------------------------------------------------------------
@@ -112,6 +117,31 @@ async def test_embedding(model, token_id: int, atol: float = 1e-5):
         return False
 
 
+async def test_rmsnorm(seed: int = 0, n: int = 768, atol: float = 1e-5):
+    print(f"--- test: rmsnorm (n={n}, seed={seed}) ---")
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(n, dtype=torch.float32, generator=g)
+    ref = ref_rmsnorm(x).numpy()
+
+    got = await run_browser_op("rmsnorm", {"input": x.tolist(), "eps": 1e-5})
+    got = torch.tensor(got, dtype=torch.float32).numpy()
+
+    if got.shape != ref.shape:
+        print(f"  SHAPE MISMATCH: ref={ref.shape}, got={got.shape}")
+        return False
+    diff = abs(ref - got).max()
+    rel = diff / (abs(ref).max() + 1e-12)
+    print(f"  max abs diff: {diff:.3e}  rel: {rel:.3e}  (tol {atol:.0e})")
+    print(f"  ref[:8]: {ref[:8]}")
+    print(f"  got[:8]: {got[:8]}")
+    if diff < atol:
+        print("  ✓ PASS")
+        return True
+    else:
+        print("  ✗ FAIL")
+        return False
+
+
 # ----------------------------------------------------------------------
 async def main():
     ap = argparse.ArgumentParser()
@@ -128,8 +158,10 @@ async def main():
 
     passed = []
     passed.append(await test_embedding(model, args.token_id))
+    passed.append(await test_rmsnorm(seed=0, n=768))
+    passed.append(await test_rmsnorm(seed=1, n=768))   # different input, sanity check
 
-    # Future: test_rmsnorm, test_matmul, test_attention, test_full_forward, etc.
+    # Future: test_matmul, test_attention, test_full_forward, etc.
 
     n_pass = sum(passed)
     n_total = len(passed)

@@ -14,7 +14,7 @@ which the Python driver invokes.</p>
 <pre id="status">Initialising…</pre>
 
 <script type="module">
-import { initWebGPU, loadModel, embeddingLookup } from "./runtime.js";
+import { initWebGPU, loadModel, embeddingLookup, rmsnorm } from "./runtime.js";
 
 const status = document.getElementById("status");
 
@@ -35,6 +35,12 @@ const status = document.getElementById("status");
         case "embedding": {
           const result = await embeddingLookup(device, model, args.tokenId);
           return Array.from(result);   // Float32Array → plain Array for JSON
+        }
+        case "rmsnorm": {
+          const input = new Float32Array(args.input);
+          const eps = args.eps ?? 1e-5;
+          const result = await rmsnorm(device, model, input, eps);
+          return Array.from(result);
         }
         default:
           throw new Error("unknown op: " + op);

@@ -92,7 +92,37 @@ async function getPipeline(device, model, name) {
 }
 
 // ---------------------------------------------------------------------
-// 4. The first real operation: embedding lookup.
+// 4. Helper: turn a Float32Array into a STORAGE GPUBuffer.
+// ---------------------------------------------------------------------
+function uploadF32(device, label, arr) {
+  const buf = device.createBuffer({
+    label, size: arr.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+  });
+  device.queue.writeBuffer(buf, 0, arr);
+  return buf;
+}
+
+// ---------------------------------------------------------------------
+// 5. Helper: read a STORAGE buffer back to CPU as Float32Array.
+// ---------------------------------------------------------------------
+async function downloadF32(device, srcBuffer, byteLength) {
+  const staging = device.createBuffer({
+    size: byteLength,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(srcBuffer, 0, staging, 0, byteLength);
+  device.queue.submit([enc.finish()]);
+  await staging.mapAsync(GPUMapMode.READ);
+  const out = new Float32Array(staging.getMappedRange().slice(0));
+  staging.unmap();
+  staging.destroy();
+  return out;
+}
+
+// ---------------------------------------------------------------------
+// 6. The first real operation: embedding lookup.
 // ---------------------------------------------------------------------
 //
 // Equivalent in PyTorch:
@@ -155,5 +185,59 @@ export async function embeddingLookup(device, model, tokenId) {
   await staging.mapAsync(GPUMapMode.READ);
   const result = new Float32Array(staging.getMappedRange().slice(0));
   staging.unmap();
+  return result;
+}
+
+// ---------------------------------------------------------------------
+// 7. RMSNorm.
+// ---------------------------------------------------------------------
+//
+// Equivalent in PyTorch:
+//     y = F.rms_norm(x, (x.size(-1),), eps=1e-5)   # no weight
+//
+// `input` is a Float32Array of length n (one row). Returns a new
+// Float32Array of length n with the row normalized. Uses 1 workgroup
+// of 64 threads internally (the shader does the reduction).
+// ---------------------------------------------------------------------
+export async function rmsnorm(device, model, input, eps = 1e-5) {
+  const pipeline = await getPipeline(device, model, "rmsnorm");
+  const n = input.length;
+
+  const inBuf = uploadF32(device, "rmsnorm_in", input);
+  const outBuf = device.createBuffer({
+    label: "rmsnorm_out",
+    size: n * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+
+  // Uniform layout: u32 n; f32 eps; padding; (16-byte alignment)
+  const uniforms = device.createBuffer({
+    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  // Use a typed-array view: 0=u32 n, 1=f32 eps, 2..3=padding
+  const ub = new ArrayBuffer(16);
+  new Uint32Array(ub, 0, 1)[0] = n;
+  new Float32Array(ub, 4, 1)[0] = eps;
+  device.queue.writeBuffer(uniforms, 0, ub);
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: inBuf } },
+      { binding: 1, resource: { buffer: outBuf } },
+      { binding: 2, resource: { buffer: uniforms } },
+    ],
+  });
+
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(1);   // single row, single workgroup
+  pass.end();
+  device.queue.submit([enc.finish()]);
+
+  const result = await downloadF32(device, outBuf, n * 4);
+  inBuf.destroy(); outBuf.destroy(); uniforms.destroy();
   return result;
 }
