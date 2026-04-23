@@ -123,7 +123,54 @@ async function downloadF32(device, srcBuffer, byteLength) {
 }
 
 // ---------------------------------------------------------------------
-// 6. The first real operation: embedding lookup.
+// 6. Generalised embedding lookup: one row of a (vocab, dim) weight.
+//    Used by both wte (token embedding) and value_embeds[i].
+// ---------------------------------------------------------------------
+export async function embeddingLookupNamed(device, model, weightName, tokenId) {
+  const w = model.tensors.get(weightName);
+  if (!w) throw new Error(`${weightName} missing from manifest`);
+  const [vocab, dim] = w.shape;
+  if (tokenId < 0 || tokenId >= vocab) throw new Error(`token id ${tokenId} out of range`);
+
+  const pipeline = await getPipeline(device, model, "embedding");
+  const outBytes = dim * 4;
+  const out = device.createBuffer({
+    label: `${weightName}_out`, size: outBytes,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  const uniformData = new Uint32Array([tokenId, dim, vocab, 0]);
+  const uniforms = device.createBuffer({
+    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(uniforms, 0, uniformData);
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: w.buffer } },
+      { binding: 1, resource: { buffer: out } },
+      { binding: 2, resource: { buffer: uniforms } },
+    ],
+  });
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(dim / 64));
+  pass.end();
+  const staging = device.createBuffer({
+    size: outBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+  enc.copyBufferToBuffer(out, 0, staging, 0, outBytes);
+  device.queue.submit([enc.finish()]);
+  await staging.mapAsync(GPUMapMode.READ);
+  const result = new Float32Array(staging.getMappedRange().slice(0));
+  staging.unmap(); staging.destroy(); out.destroy(); uniforms.destroy();
+  return result;
+}
+
+// ---------------------------------------------------------------------
+// 6b. The first real operation: embedding lookup (wte).
 // ---------------------------------------------------------------------
 //
 // Equivalent in PyTorch:
@@ -421,6 +468,59 @@ export async function ropeApply(device, model, x, N, D, T0 = 0) {
   const result = await downloadF32(device, yBuf, N * D * 4);
   xBuf.destroy(); yBuf.destroy(); uniforms.destroy();
   return result;
+}
+
+// ---------------------------------------------------------------------
+// Softcap: y = cap * tanh(x / cap). Element-wise unary.
+// ---------------------------------------------------------------------
+export async function softcap(device, model, a, cap = 15.0) {
+  return _elemUnary(device, model, "softcap", a, cap);
+}
+
+// ---------------------------------------------------------------------
+// Full forward pass for a single token. No KV cache (fresh state).
+// Returns logits (vocab_size,).
+// ---------------------------------------------------------------------
+export async function forward(device, model, tokenId) {
+  const cfg = model.config;
+  const n_layer = cfg.n_layer;
+  const n_embd = cfg.n_embd;
+
+  // 1. Embedding + norm + save x0
+  let x = await embeddingLookup(device, model, tokenId);
+  x = await rmsnorm(device, model, x);
+  const x0 = new Float32Array(x);   // snapshot the initial normalised embedding
+
+  // 2. Transformer blocks (no smear on first token — cache is fresh)
+  const backoutIdx = Math.floor(n_layer / 2);
+  let xBackout = null;
+  for (let i = 0; i < n_layer; i++) {
+    let ve = null;
+    const veName = `value_embeds.${i}.weight`;
+    if (model.tensors.has(veName)) {
+      ve = await embeddingLookupNamed(device, model, veName, tokenId);
+    }
+    x = await transformerBlock(device, model, i, x, x0, 0, ve);
+    if (i === backoutIdx) xBackout = new Float32Array(x);
+  }
+
+  // 3. Backout subtract: x = x - backout_lambda * x_backout
+  if (xBackout !== null) {
+    if (model.backoutLambda === undefined) {
+      model.backoutLambda = (await downloadF32(device, model.tensors.get("backout_lambda").buffer, 4))[0];
+    }
+    const negScaled = await scalarMul(device, model, xBackout, -model.backoutLambda);
+    x = await add(device, model, x, negScaled);
+  }
+
+  // 4. Final norm + lm_head
+  x = await rmsnorm(device, model, x);
+  const paddedVocab = model.tensors.get("lm_head.weight").shape[0];
+  const logitsPadded = await linear(device, model, x, 1, n_embd, "lm_head.weight");
+
+  // 5. Slice to true vocab and softcap
+  const logits = logitsPadded.slice(0, cfg.vocab_size);
+  return await softcap(device, model, logits, 15.0);
 }
 
 // ---------------------------------------------------------------------

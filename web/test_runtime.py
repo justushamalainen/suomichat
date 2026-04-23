@@ -207,6 +207,47 @@ async def test_elementwise(seed: int = 0, n: int = 768):
     return all(results)
 
 
+async def test_full_forward(model, token_id: int = 100, atol: float = 0.3):
+    """Run the full 12-layer forward for a single token. Compare to
+    PyTorch's first-position logits from a 2-token forward (so the
+    model's T>1 assertion doesn't trip; smear doesn't touch position 0).
+
+    Acceptance: (a) argmax must match exactly (the functional property
+    that matters for greedy sampling), AND (b) absolute logit diff
+    under `atol`. 0.3 absolute covers the 12-layer compound fp32
+    accumulation drift through 32K-col lm_head matmul + softcap;
+    relative error stays ~1%.
+    """
+    print(f"--- test: full_forward token_id={token_id} ---")
+    tokens = torch.tensor([[token_id, token_id]])
+    with torch.no_grad():
+        logits_all = model(tokens).cpu().float().numpy()
+    ref = logits_all[0, 0]
+
+    got = await run_browser_op("full_forward", {"tokenId": token_id})
+    got = torch.tensor(got, dtype=torch.float32).numpy()
+
+    if got.shape != ref.shape:
+        print(f"  SHAPE MISMATCH: ref={ref.shape}, got={got.shape}")
+        return False
+
+    diff = abs(ref - got).max()
+    rel = diff / (abs(ref).max() + 1e-12)
+    ref_argmax = int(ref.argmax())
+    got_argmax = int(got.argmax())
+    ref_top3 = ref.argsort()[-3:][::-1].tolist()
+    got_top3 = got.argsort()[-3:][::-1].tolist()
+    print(f"  max abs diff: {diff:.3e}  rel: {rel:.3e}  (tol {atol:.2f})")
+    print(f"  argmax — ref: {ref_argmax}  got: {got_argmax}  {'MATCH' if ref_argmax == got_argmax else 'MISMATCH'}")
+    print(f"  top-3 ref: {ref_top3}  got: {got_top3}")
+    ok = diff <= atol and ref_argmax == got_argmax
+    if ok:
+        print("  ✓ PASS")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_transformer_block(model, layer_idx: int = 0, seed: int = 0, atol: float = 5e-4):
     """Full block: resid_lambda mix + attn + mlp + residuals. Against model.transformer.h[i]."""
     from suomichat.gpt import has_ve
@@ -446,8 +487,10 @@ async def main():
     passed.append(await test_attention_block(model, layer_idx=1))               # has value embeds
     passed.append(await test_transformer_block(model, layer_idx=0))
     passed.append(await test_transformer_block(model, layer_idx=1))
+    passed.append(await test_full_forward(model, token_id=100))
+    passed.append(await test_full_forward(model, token_id=7))
 
-    # Future: test_full_forward, etc.
+    # Future: test_kv_cache_two_tokens, test_greedy_generate_16, etc.
 
     n_pass = sum(passed)
     n_total = len(passed)
