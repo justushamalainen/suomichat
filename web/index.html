@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SuomiChat — WebGPU runtime (Phase 1)</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; }
+  pre { background: #f6f6f6; padding: 1rem; overflow: auto; font-size: 12px; }
+  .ok { color: #228822; }
+  .warn { color: #cc7700; }
+  .err { color: #cc0000; }
+  button { padding: 0.5rem 1rem; cursor: pointer; }
+  #status { white-space: pre-line; }
+</style>
+</head>
+<body>
+
+<h1>SuomiChat — WebGPU runtime <small>Phase 1</small></h1>
+<p>
+  This page loads a suomichat checkpoint into your browser's GPU and
+  runs the very first operation in the forward pass: an embedding
+  lookup for a fixed token. Open the JS console for tensor dumps.
+</p>
+
+<button id="run">Load and run</button>
+<div id="status">Click "Load and run" to start.</div>
+<pre id="output"></pre>
+
+<script type="module">
+import { initWebGPU, loadModel, embeddingLookup } from "./runtime.js";
+
+const statusEl = document.getElementById("status");
+const outEl = document.getElementById("output");
+
+function log(msg, cls) {
+  const line = document.createElement("div");
+  line.textContent = msg;
+  if (cls) line.className = cls;
+  statusEl.appendChild(line);
+  console.log(msg);
+}
+
+document.getElementById("run").onclick = async () => {
+  statusEl.textContent = "";
+  outEl.textContent = "";
+
+  try {
+    log("1/4: initialising WebGPU…");
+    const { device } = await initWebGPU();
+    log(`     ✓ device ready (${device.label || "default adapter"})`, "ok");
+
+    log("2/4: fetching config + tensors manifest…");
+    const config = await (await fetch("./config.json")).json();
+    const manifest = await (await fetch("./tensors.json")).json();
+    log(`     ✓ d${config.n_layer}, vocab=${config.vocab_size}, n_embd=${config.n_embd}`, "ok");
+    log(`     ✓ ${Object.keys(manifest.tensors).length} tensors, ${(manifest.total_size / 1024**2).toFixed(1)} MB`);
+
+    log("3/4: streaming weights.bin to GPU (this is the big download)…");
+    const t0 = performance.now();
+    const model = await loadModel(device, config, manifest, "./weights.bin");
+    const dt = ((performance.now() - t0) / 1000).toFixed(1);
+    log(`     ✓ loaded in ${dt}s`, "ok");
+
+    log("4/4: running embedding lookup for token id 100…");
+    const tokenId = 100;
+    const embedding = await embeddingLookup(device, model, tokenId);
+    log(`     ✓ embedding[${tokenId}] shape: [${embedding.length}]`, "ok");
+    outEl.textContent =
+      `embedding[${tokenId}] first 16 values:\n  ` +
+      Array.from(embedding.slice(0, 16)).map(v => v.toFixed(4)).join(", ") +
+      `\n\nrun verify.py to compare against PyTorch.`;
+  } catch (e) {
+    log("FAILED: " + (e.message || e), "err");
+    console.error(e);
+  }
+};
+</script>
+
+</body>
+</html>
