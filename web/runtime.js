@@ -324,6 +324,53 @@ async function _elemUnary(device, model, name, a, extraFloat = null) {
 }
 
 // ---------------------------------------------------------------------
+// Linear layer: y = x @ weight.T (no bias). Weight tensor lives on GPU
+// from loadModel; pass its name (e.g. "transformer.h.0.attn.c_q.weight").
+// ---------------------------------------------------------------------
+export async function linear(device, model, x, M, K, weightName) {
+  const w = model.tensors.get(weightName);
+  if (!w) throw new Error(`linear: weight ${weightName} not in manifest`);
+  const [N, Kw] = w.shape;
+  if (Kw !== K) throw new Error(`linear shape mismatch: x has K=${K}, weight has K=${Kw}`);
+
+  const pipeline = await getPipeline(device, model, "linear");
+  const xBuf = uploadF32(device, "linear_x", x);
+  const yBuf = device.createBuffer({
+    label: "linear_y", size: M * N * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  const ub = new ArrayBuffer(16);
+  const u32 = new Uint32Array(ub);
+  u32[0] = M; u32[1] = K; u32[2] = N;
+  const uniforms = device.createBuffer({
+    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(uniforms, 0, ub);
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: xBuf } },
+      { binding: 1, resource: { buffer: w.buffer } },
+      { binding: 2, resource: { buffer: yBuf } },
+      { binding: 3, resource: { buffer: uniforms } },
+    ],
+  });
+
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(M / 8), Math.ceil(N / 8));
+  pass.end();
+  device.queue.submit([enc.finish()]);
+
+  const result = await downloadF32(device, yBuf, M * N * 4);
+  xBuf.destroy(); yBuf.destroy(); uniforms.destroy();
+  return result;
+}
+
+// ---------------------------------------------------------------------
 // RoPE: rotate the last dim of x using model.cos / model.sin at time T0.
 // x has shape (N, D) where D = head_dim; cos/sin have shape
 // (rotary_seq_len, d) with d = D/2 (these buffers already live on the GPU
@@ -373,6 +420,21 @@ export async function ropeApply(device, model, x, N, D, T0 = 0) {
   const result = await downloadF32(device, yBuf, N * D * 4);
   xBuf.destroy(); yBuf.destroy(); uniforms.destroy();
   return result;
+}
+
+// ---------------------------------------------------------------------
+// MLP block for one transformer layer.
+//   y = c_proj(relu²(c_fc(x)))
+// ---------------------------------------------------------------------
+export async function mlpBlock(device, model, layerIdx, x) {
+  const prefix = `transformer.h.${layerIdx}.mlp`;
+  const n_embd = model.config.n_embd;
+  const hidden = 4 * n_embd;           // c_fc expands by 4×
+  const M = x.length / n_embd;         // batch*time rows
+  const h = await linear(device, model, x, M, n_embd, `${prefix}.c_fc.weight`);
+  const a = await relu2(device, model, h);
+  const y = await linear(device, model, a, M, hidden, `${prefix}.c_proj.weight`);
+  return y;
 }
 
 export const add         = (device, model, a, b)        => _elemBinary(device, model, "add", a, b);

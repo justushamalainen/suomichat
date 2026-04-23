@@ -69,6 +69,11 @@ def ref_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Ten
     return torch.cat([y1, y2], dim=-1)
 
 
+def ref_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """PyTorch reference for nn.Linear without bias: y = x @ weight.T"""
+    return torch.nn.functional.linear(x, weight)
+
+
 # ----------------------------------------------------------------------
 # Headless Chrome driver
 # ----------------------------------------------------------------------
@@ -202,6 +207,54 @@ async def test_elementwise(seed: int = 0, n: int = 768):
     return all(results)
 
 
+async def test_mlp_block(model, layer_idx: int = 0, seed: int = 0, atol: float = 5e-4):
+    """Verify our mlpBlock against model.transformer.h[i].mlp on a random x."""
+    print(f"--- test: mlp_block layer {layer_idx} ---")
+    g = torch.Generator().manual_seed(seed)
+    n_embd = model.config.n_embd
+    x = torch.randn(1, 1, n_embd, dtype=torch.float32, generator=g)
+    with torch.no_grad():
+        ref = model.transformer.h[layer_idx].mlp(x).cpu().float().numpy()
+
+    got = await run_browser_op("mlp", {"x": x.flatten().tolist(), "layerIdx": layer_idx})
+    got = torch.tensor(got, dtype=torch.float32).view(ref.shape).numpy()
+    diff = abs(ref - got).max()
+    print(f"  max abs diff: {diff:.3e}  (tol {atol:.0e})")
+    if diff <= atol:
+        print("  ✓ PASS")
+        return True
+    print(f"  ref[0, 0, :6]: {ref[0, 0, :6]}")
+    print(f"  got[0, 0, :6]: {got[0, 0, :6]}")
+    print("  ✗ FAIL")
+    return False
+
+
+async def test_linear(model, weight_name: str, seed: int = 0, atol: float = 5e-4):
+    """Verify our `linear` shader against nn.Linear using a real model weight."""
+    print(f"--- test: linear '{weight_name}' ---")
+    w = dict(model.named_parameters())[weight_name].detach().cpu().float()
+    N, K = w.shape
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(1, K, dtype=torch.float32, generator=g)
+    ref = ref_linear(x, w).numpy()
+
+    got = await run_browser_op("linear", {
+        "x": x.flatten().tolist(),
+        "M": 1, "K": K,
+        "weightName": weight_name,
+    })
+    got = torch.tensor(got, dtype=torch.float32).view(1, N).numpy()
+    diff = abs(ref - got).max()
+    print(f"  max abs diff: {diff:.3e}  (tol {atol:.0e})")
+    if diff <= atol:
+        print("  ✓ PASS")
+        return True
+    print(f"  ref[0, :6]: {ref[0, :6]}")
+    print(f"  got[0, :6]: {got[0, :6]}")
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_rope(model, seed: int = 0, T0: int = 0, atol: float = 1e-5):
     print(f"--- test: rope (T0={T0}) ---")
     g = torch.Generator().manual_seed(seed)
@@ -285,6 +338,10 @@ async def main():
     passed.append(await test_elementwise(seed=0, n=768))              # add/mul/scalar_mul/relu2/sigmoid
     passed.append(await test_rope(model, seed=0, T0=0))
     passed.append(await test_rope(model, seed=1, T0=17))              # non-zero offset
+    passed.append(await test_linear(model, "transformer.h.0.attn.c_q.weight"))  # (768, 768)
+    passed.append(await test_linear(model, "transformer.h.0.mlp.c_fc.weight"))  # (3072, 768) d12: 4*n_embd
+    passed.append(await test_mlp_block(model, layer_idx=0))
+    passed.append(await test_mlp_block(model, layer_idx=6))                     # mid-stack sanity
 
     # Future: test_attention, test_full_forward, etc.
 

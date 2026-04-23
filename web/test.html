@@ -14,8 +14,8 @@ which the Python driver invokes.</p>
 <pre id="status">Initialising…</pre>
 
 <script type="module">
-import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul,
-         add, mul, scalarMul, relu2, sigmoid, ropeApply } from "./runtime.js";
+import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul, linear,
+         add, mul, scalarMul, relu2, sigmoid, ropeApply, mlpBlock } from "./runtime.js";
 
 const status = document.getElementById("status");
 
@@ -71,6 +71,14 @@ const status = document.getElementById("status");
         }
         case "rope": {
           const r = await ropeApply(device, model, new Float32Array(args.x), args.N, args.D, args.T0);
+          return Array.from(r);
+        }
+        case "linear": {
+          const r = await linear(device, model, new Float32Array(args.x), args.M, args.K, args.weightName);
+          return Array.from(r);
+        }
+        case "mlp": {
+          const r = await mlpBlock(device, model, args.layerIdx, new Float32Array(args.x));
           return Array.from(r);
         }
         default:
