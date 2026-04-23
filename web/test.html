@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SuomiChat WebGPU runtime — test harness</title>
+</head>
+<body>
+
+<h1>Test harness</h1>
+<p>This page is loaded by <code>test_runtime.py</code> via Playwright.
+It loads the model once, then exposes <code>window.run(op, args)</code>
+which the Python driver invokes.</p>
+
+<pre id="status">Initialising…</pre>
+
+<script type="module">
+import { initWebGPU, loadModel, embeddingLookup } from "./runtime.js";
+
+const status = document.getElementById("status");
+
+(async () => {
+  try {
+    status.textContent = "Initialising WebGPU…";
+    const { device } = await initWebGPU();
+    status.textContent += "\nFetching config + manifest…";
+    const config = await (await fetch("./config.json")).json();
+    const manifest = await (await fetch("./tensors.json")).json();
+    status.textContent += `\nLoading ${(manifest.total_size / 1024**2).toFixed(0)} MB of weights…`;
+    const model = await loadModel(device, config, manifest, "./weights.bin");
+    status.textContent += "\n✓ ready";
+
+    // Exposed to Python via page.evaluate
+    window.run = async (op, args) => {
+      switch (op) {
+        case "embedding": {
+          const result = await embeddingLookup(device, model, args.tokenId);
+          return Array.from(result);   // Float32Array → plain Array for JSON
+        }
+        default:
+          throw new Error("unknown op: " + op);
+      }
+    };
+
+    window.runtimeReady = true;
+  } catch (e) {
+    status.textContent = "FAILED: " + (e.message || e);
+    console.error(e);
+    window.runtimeError = e.message || String(e);
+  }
+})();
+</script>
+
+</body>
+</html>

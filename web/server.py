@@ -14,7 +14,7 @@ import socketserver
 import os
 import sys
 
-PORT = 8080
+PORT = 9876
 
 # Serve the directory this script lives in
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
