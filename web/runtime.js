@@ -210,6 +210,148 @@ function uploadF32(device, label, arr) {
 }
 
 // ---------------------------------------------------------------------
+// 4c. Dispatch helper: pool a 16-byte (or 32-byte) uniform buffer,
+// build a bind group, submit one dispatch, return. Caller releases the
+// uniform buffer via the pool after the next idle cycle (we just queue
+// and forget — WebGPU queue is in-order so the next acquire/use is safe).
+// ---------------------------------------------------------------------
+const UNIFORM_USAGE = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
+
+function _writeUniforms(device, model, u32s, f32Pairs = []) {
+  // u32s: array of u32 values starting at offset 0.
+  // f32Pairs: array of [byteOffset, f32Value] for f32 fields mixed in.
+  const minSize = Math.max(16, u32s.length * 4);
+  const size = (minSize + 15) & ~15;
+  const buf = _ensurePool(model).acquire(device, size, UNIFORM_USAGE, "uniforms");
+  const ab = new ArrayBuffer(size);
+  const u32 = new Uint32Array(ab);
+  for (let i = 0; i < u32s.length; i++) u32[i] = u32s[i];
+  if (f32Pairs.length) {
+    const dv = new DataView(ab);
+    for (const [off, v] of f32Pairs) dv.setFloat32(off, v, true);
+  }
+  device.queue.writeBuffer(buf, 0, ab);
+  return buf;
+}
+
+// Submit a single compute dispatch. `bufferBindings` is an array of
+// GPUBuffers in binding-index order (bindings 0..N-1); `uniformsBuf` is
+// bound at the next index. `dispatch` is [x] or [x, y] or [x, y, z].
+function _dispatch(device, pipeline, bufferBindings, uniformsBuf, dispatch) {
+  const entries = bufferBindings.map((b, i) => ({ binding: i, resource: { buffer: b } }));
+  if (uniformsBuf) entries.push({ binding: bufferBindings.length, resource: { buffer: uniformsBuf } });
+  const bg = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bg);
+  pass.dispatchWorkgroups(dispatch[0], dispatch[1] ?? 1, dispatch[2] ?? 1);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+}
+
+// ---------------------------------------------------------------------
+// 4d. Tensor-typed primitives (the "fast path" — Tensor in, Tensor out,
+// no CPU round-trip). The Float32Array-style primitives below are now
+// thin wrappers over these.
+// ---------------------------------------------------------------------
+
+export async function rmsnormT(device, model, x, eps = 1e-5) {
+  const n = x.shape[x.shape.length - 1];
+  const pipeline = await getPipeline(device, model, "rmsnorm");
+  const y = allocTensor(device, model, x.shape, "rmsnorm_y");
+  const u = _writeUniforms(device, model, [n], [[4, eps]]);
+  _dispatch(device, pipeline, [x.buffer, y.buffer], u, [1]);   // single row, single workgroup
+  _ensurePool(model).release(u);
+  return y;
+}
+
+async function _elemBinaryT(device, model, name, a, b) {
+  if (a.byteLength !== b.byteLength) throw new Error(`${name}T: shape mismatch ${a.byteLength} vs ${b.byteLength}`);
+  const n = a.byteLength / 4;
+  const pipeline = await getPipeline(device, model, name);
+  const c = allocTensor(device, model, a.shape, `${name}_out`);
+  const u = _writeUniforms(device, model, [n]);
+  _dispatch(device, pipeline, [a.buffer, b.buffer, c.buffer], u, [Math.ceil(n / 64)]);
+  _ensurePool(model).release(u);
+  return c;
+}
+
+async function _elemUnaryT(device, model, name, a, extraF32 = null) {
+  const n = a.byteLength / 4;
+  const pipeline = await getPipeline(device, model, name);
+  const c = allocTensor(device, model, a.shape, `${name}_out`);
+  const u = _writeUniforms(device, model, [n], extraF32 !== null ? [[4, extraF32]] : []);
+  _dispatch(device, pipeline, [a.buffer, c.buffer], u, [Math.ceil(n / 64)]);
+  _ensurePool(model).release(u);
+  return c;
+}
+
+export const addT       = (d, m, a, b)         => _elemBinaryT(d, m, "add", a, b);
+export const mulT       = (d, m, a, b)         => _elemBinaryT(d, m, "mul", a, b);
+export const scalarMulT = (d, m, a, alpha)     => _elemUnaryT (d, m, "scalar_mul", a, alpha);
+export const relu2T     = (d, m, a)            => _elemUnaryT (d, m, "relu2", a);
+export const sigmoidT   = (d, m, a)            => _elemUnaryT (d, m, "sigmoid", a);
+export const softcapT   = (d, m, a, cap = 15)  => _elemUnaryT (d, m, "softcap", a, cap);
+
+// RoPE on Tensor x of shape (N, D). T0 = position offset into cos/sin.
+export async function ropeApplyT(device, model, x, T0 = 0) {
+  const D = x.shape[x.shape.length - 1];
+  if (D % 2 !== 0) throw new Error("ropeT: D must be even");
+  const N = x.shape.length === 1 ? 1 : x.shape[0];
+  const d = D / 2;
+  const pipeline = await getPipeline(device, model, "rope");
+  const cos = model.tensors.get("cos"), sin = model.tensors.get("sin");
+  if (!cos || !sin) throw new Error("ropeT: cos/sin missing");
+  const y = allocTensor(device, model, x.shape, "rope_y");
+  const u = _writeUniforms(device, model, [N, D, d, T0]);
+  _dispatch(device, pipeline, [x.buffer, cos.buffer, sin.buffer, y.buffer], u,
+            [Math.ceil(N * D / 64)]);
+  _ensurePool(model).release(u);
+  return y;
+}
+
+// Row-wise softmax. x shape (rows, n).
+export async function softmaxT(device, model, x, rows, n) {
+  const pipeline = await getPipeline(device, model, "softmax");
+  const y = allocTensor(device, model, x.shape, "softmax_y");
+  const u = _writeUniforms(device, model, [rows, n]);
+  _dispatch(device, pipeline, [x.buffer, y.buffer], u, [rows]);
+  _ensurePool(model).release(u);
+  return y;
+}
+
+// Embedding lookup: a row of `weightName`. Returns Tensor of shape (dim,).
+export async function embeddingT(device, model, weightName, tokenId) {
+  const w = model.tensors.get(weightName);
+  if (!w) throw new Error(`embeddingT: ${weightName} missing`);
+  const [vocab, dim] = w.shape;
+  const pipeline = await getPipeline(device, model, "embedding");
+  const y = allocTensor(device, model, [dim], `${weightName}_row`);
+  const u = _writeUniforms(device, model, [tokenId, dim, vocab, 0]);
+  _dispatch(device, pipeline, [w.buffer, y.buffer], u, [Math.ceil(dim / 64)]);
+  _ensurePool(model).release(u);
+  return y;
+}
+
+export async function linearT(device, model, x, weightName) {
+  const w = model.tensors.get(weightName);
+  if (!w) throw new Error(`linearT: ${weightName} missing`);
+  const [N, K] = w.shape;
+  const M = x.shape.length === 1 ? 1 : x.shape[0];
+  if (x.shape[x.shape.length - 1] !== K) {
+    throw new Error(`linearT shape mismatch: x last-dim ${x.shape[x.shape.length - 1]} vs weight K=${K}`);
+  }
+  const pipeline = await getPipeline(device, model, "linear");
+  const y = allocTensor(device, model, [M, N], "linear_y");
+  const u = _writeUniforms(device, model, [M, K, N, 0]);
+  _dispatch(device, pipeline, [x.buffer, w.buffer, y.buffer], u,
+            [Math.ceil(M / 8), Math.ceil(N / 8)]);
+  _ensurePool(model).release(u);
+  return y;
+}
+
+// ---------------------------------------------------------------------
 // 5. Helper: read a STORAGE buffer back to CPU as Float32Array.
 // ---------------------------------------------------------------------
 async function downloadF32(device, srcBuffer, byteLength) {
@@ -228,351 +370,82 @@ async function downloadF32(device, srcBuffer, byteLength) {
 }
 
 // ---------------------------------------------------------------------
-// 6. Generalised embedding lookup: one row of a (vocab, dim) weight.
-//    Used by both wte (token embedding) and value_embeds[i].
+// Embedding lookup wrappers. Both call embeddingT under the hood.
 // ---------------------------------------------------------------------
 export async function embeddingLookupNamed(device, model, weightName, tokenId) {
-  const w = model.tensors.get(weightName);
-  if (!w) throw new Error(`${weightName} missing from manifest`);
-  const [vocab, dim] = w.shape;
-  if (tokenId < 0 || tokenId >= vocab) throw new Error(`token id ${tokenId} out of range`);
-
-  const pipeline = await getPipeline(device, model, "embedding");
-  const outBytes = dim * 4;
-  const out = device.createBuffer({
-    label: `${weightName}_out`, size: outBytes,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-  });
-  const uniformData = new Uint32Array([tokenId, dim, vocab, 0]);
-  const uniforms = device.createBuffer({
-    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(uniforms, 0, uniformData);
-
-  const bindGroup = device.createBindGroup({
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: w.buffer } },
-      { binding: 1, resource: { buffer: out } },
-      { binding: 2, resource: { buffer: uniforms } },
-    ],
-  });
-  const enc = device.createCommandEncoder();
-  const pass = enc.beginComputePass();
-  pass.setPipeline(pipeline);
-  pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(Math.ceil(dim / 64));
-  pass.end();
-  const staging = device.createBuffer({
-    size: outBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-  });
-  enc.copyBufferToBuffer(out, 0, staging, 0, outBytes);
-  device.queue.submit([enc.finish()]);
-  await staging.mapAsync(GPUMapMode.READ);
-  const result = new Float32Array(staging.getMappedRange().slice(0));
-  staging.unmap(); staging.destroy(); out.destroy(); uniforms.destroy();
-  return result;
+  const t = await embeddingT(device, model, weightName, tokenId);
+  const out = await downloadTensor(device, t);
+  releaseTensor(model, t);
+  return out;
 }
 
-// ---------------------------------------------------------------------
-// 6b. The first real operation: embedding lookup (wte).
-// ---------------------------------------------------------------------
-//
-// Equivalent in PyTorch:
-//     x = model.transformer.wte(token_id)   # shape (n_embd,)
-//
-// We dispatch one workgroup with `n_embd` threads. Each thread copies
-// one element from row `tokenId` of the embedding matrix into the
-// output buffer. (Yes, this is the slowest possible way to do an
-// embedding lookup. It's also the most readable.)
-// ---------------------------------------------------------------------
 export async function embeddingLookup(device, model, tokenId) {
-  const wte = model.tensors.get("transformer.wte.weight");
-  if (!wte) throw new Error("transformer.wte.weight missing from manifest");
-  const [vocab, nEmbd] = wte.shape;
-  if (tokenId < 0 || tokenId >= vocab) throw new Error(`token id ${tokenId} out of range`);
-
-  const pipeline = await getPipeline(device, model, "embedding");
-
-  // Output buffer: one row of the embedding matrix.
-  const outBytes = nEmbd * 4;
-  const out = device.createBuffer({
-    label: "embedding_out",
-    size: outBytes,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-  });
-
-  // Uniforms: token id + dimensions. Uniforms must be 16-byte aligned.
-  const uniformData = new Uint32Array([tokenId, nEmbd, vocab, 0]);
-  const uniforms = device.createBuffer({
-    size: 16,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(uniforms, 0, uniformData);
-
-  const bindGroup = device.createBindGroup({
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: wte.buffer } },
-      { binding: 1, resource: { buffer: out } },
-      { binding: 2, resource: { buffer: uniforms } },
-    ],
-  });
-
-  // Dispatch: one workgroup, ceil(nEmbd / 64) workgroup-x threads handled
-  // by the shader's @workgroup_size(64).
-  const enc = device.createCommandEncoder();
-  const pass = enc.beginComputePass();
-  pass.setPipeline(pipeline);
-  pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(Math.ceil(nEmbd / 64));
-  pass.end();
-
-  // Stage out → CPU so we can return it to JS as a Float32Array.
-  const staging = device.createBuffer({
-    size: outBytes,
-    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-  });
-  enc.copyBufferToBuffer(out, 0, staging, 0, outBytes);
-  device.queue.submit([enc.finish()]);
-  await staging.mapAsync(GPUMapMode.READ);
-  const result = new Float32Array(staging.getMappedRange().slice(0));
-  staging.unmap();
-  return result;
+  return embeddingLookupNamed(device, model, "transformer.wte.weight", tokenId);
 }
 
 // ---------------------------------------------------------------------
-// 7. Matmul: C (M×N) = A (M×K) @ B (K×N), row-major f32.
+// 7. Matmul: C (M×N) = A (M×K) @ B (K×N), row-major f32. Test-only.
 // ---------------------------------------------------------------------
-//
-// Takes Float32Array inputs for a test-friendly API. Internally uploads
-// to GPU, dispatches the matmul shader, reads back the result. Future
-// phases will want a pure-GPU variant (aBuf, bBuf → cBuf) so we don't
-// round-trip through CPU; we add that when the first non-test caller
-// appears.
-// ---------------------------------------------------------------------
-export async function matmul(device, model, a, aShape, b, bShape) {
-  const [M, K] = aShape;
-  const [K2, N] = bShape;
-  if (K !== K2) throw new Error(`matmul shape mismatch: (${M},${K}) @ (${K2},${N})`);
-
+export async function matmulT(device, model, a, b) {
+  const [M, K] = a.shape, [K2, N] = b.shape;
+  if (K !== K2) throw new Error(`matmulT: (${M},${K}) @ (${K2},${N})`);
   const pipeline = await getPipeline(device, model, "matmul");
-  const aBuf = uploadF32(device, "matmul_a", a);
-  const bBuf = uploadF32(device, "matmul_b", b);
-  const cBuf = device.createBuffer({
-    label: "matmul_c", size: M * N * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-  });
+  const c = allocTensor(device, model, [M, N], "matmul_c");
+  const u = _writeUniforms(device, model, [M, K, N, 0]);
+  _dispatch(device, pipeline, [a.buffer, b.buffer, c.buffer], u, [Math.ceil(M / 8), Math.ceil(N / 8)]);
+  _ensurePool(model).release(u);
+  return c;
+}
 
-  const ub = new ArrayBuffer(16);
-  const u32 = new Uint32Array(ub);
-  u32[0] = M; u32[1] = K; u32[2] = N;
-  const uniforms = device.createBuffer({
-    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(uniforms, 0, ub);
-
-  const bindGroup = device.createBindGroup({
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: aBuf } },
-      { binding: 1, resource: { buffer: bBuf } },
-      { binding: 2, resource: { buffer: cBuf } },
-      { binding: 3, resource: { buffer: uniforms } },
-    ],
-  });
-
-  const enc = device.createCommandEncoder();
-  const pass = enc.beginComputePass();
-  pass.setPipeline(pipeline);
-  pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(Math.ceil(M / 8), Math.ceil(N / 8));
-  pass.end();
-  device.queue.submit([enc.finish()]);
-
-  const result = await downloadF32(device, cBuf, M * N * 4);
-  aBuf.destroy(); bBuf.destroy(); cBuf.destroy(); uniforms.destroy();
-  return result;
+export async function matmul(device, model, a, aShape, b, bShape) {
+  const aT = uploadTensor(device, model, a, aShape, "matmul_a");
+  const bT = uploadTensor(device, model, b, bShape, "matmul_b");
+  const cT = await matmulT(device, model, aT, bT);
+  const out = await downloadTensor(device, cT);
+  releaseTensor(model, aT); releaseTensor(model, bT); releaseTensor(model, cT);
+  return out;
 }
 
 // ---------------------------------------------------------------------
-// Element-wise ops (add, mul, scalar_mul, relu2, sigmoid).
-// All take Float32Array input(s) + return Float32Array for test-friendliness.
+// Float32Array element-wise wrappers. Each calls the corresponding T
+// version. Bigger composites use the T versions directly.
 // ---------------------------------------------------------------------
-function buildBinaryUniforms(device, n) {
-  const ub = new ArrayBuffer(16);
-  new Uint32Array(ub, 0, 1)[0] = n;
-  const buf = device.createBuffer({
-    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(buf, 0, ub);
-  return buf;
+async function _binWrap(device, model, name, aArr, bArr) {
+  const aT = uploadTensor(device, model, aArr);
+  const bT = uploadTensor(device, model, bArr);
+  const cT = await _elemBinaryT(device, model, name, aT, bT);
+  const out = await downloadTensor(device, cT);
+  releaseTensor(model, aT); releaseTensor(model, bT); releaseTensor(model, cT);
+  return out;
 }
-
-async function _elemBinary(device, model, name, a, b) {
-  if (a.length !== b.length) throw new Error(`${name}: shape mismatch ${a.length} vs ${b.length}`);
-  const n = a.length;
-  const pipeline = await getPipeline(device, model, name);
-  const aBuf = uploadF32(device, `${name}_a`, a);
-  const bBuf = uploadF32(device, `${name}_b`, b);
-  const cBuf = device.createBuffer({
-    label: `${name}_c`, size: n * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-  });
-  const uniforms = buildBinaryUniforms(device, n);
-  const bindGroup = device.createBindGroup({
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: aBuf } },
-      { binding: 1, resource: { buffer: bBuf } },
-      { binding: 2, resource: { buffer: cBuf } },
-      { binding: 3, resource: { buffer: uniforms } },
-    ],
-  });
-  const enc = device.createCommandEncoder();
-  const pass = enc.beginComputePass();
-  pass.setPipeline(pipeline);
-  pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(Math.ceil(n / 64));
-  pass.end();
-  device.queue.submit([enc.finish()]);
-  const result = await downloadF32(device, cBuf, n * 4);
-  aBuf.destroy(); bBuf.destroy(); cBuf.destroy(); uniforms.destroy();
-  return result;
-}
-
-async function _elemUnary(device, model, name, a, extraFloat = null) {
-  const n = a.length;
-  const pipeline = await getPipeline(device, model, name);
-  const aBuf = uploadF32(device, `${name}_a`, a);
-  const cBuf = device.createBuffer({
-    label: `${name}_c`, size: n * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-  });
-  const ub = new ArrayBuffer(16);
-  new Uint32Array(ub, 0, 1)[0] = n;
-  if (extraFloat !== null) new Float32Array(ub, 4, 1)[0] = extraFloat;
-  const uniforms = device.createBuffer({
-    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(uniforms, 0, ub);
-  const bindGroup = device.createBindGroup({
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: aBuf } },
-      { binding: 1, resource: { buffer: cBuf } },
-      { binding: 2, resource: { buffer: uniforms } },
-    ],
-  });
-  const enc = device.createCommandEncoder();
-  const pass = enc.beginComputePass();
-  pass.setPipeline(pipeline);
-  pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(Math.ceil(n / 64));
-  pass.end();
-  device.queue.submit([enc.finish()]);
-  const result = await downloadF32(device, cBuf, n * 4);
-  aBuf.destroy(); cBuf.destroy(); uniforms.destroy();
-  return result;
+async function _unWrap(device, model, name, aArr, extra = null) {
+  const aT = uploadTensor(device, model, aArr);
+  const cT = await _elemUnaryT(device, model, name, aT, extra);
+  const out = await downloadTensor(device, cT);
+  releaseTensor(model, aT); releaseTensor(model, cT);
+  return out;
 }
 
 // ---------------------------------------------------------------------
-// Linear layer: y = x @ weight.T (no bias). Weight tensor lives on GPU
-// from loadModel; pass its name (e.g. "transformer.h.0.attn.c_q.weight").
+// Float32Array → Float32Array wrapper for tests. Internally uploads,
+// dispatches via linearT, downloads, releases. Composites should call
+// linearT directly so they never touch CPU.
 // ---------------------------------------------------------------------
 export async function linear(device, model, x, M, K, weightName) {
-  const w = model.tensors.get(weightName);
-  if (!w) throw new Error(`linear: weight ${weightName} not in manifest`);
-  const [N, Kw] = w.shape;
-  if (Kw !== K) throw new Error(`linear shape mismatch: x has K=${K}, weight has K=${Kw}`);
-
-  const pipeline = await getPipeline(device, model, "linear");
-  const xBuf = uploadF32(device, "linear_x", x);
-  const yBuf = device.createBuffer({
-    label: "linear_y", size: M * N * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-  });
-  const ub = new ArrayBuffer(16);
-  const u32 = new Uint32Array(ub);
-  u32[0] = M; u32[1] = K; u32[2] = N;
-  const uniforms = device.createBuffer({
-    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(uniforms, 0, ub);
-
-  const bindGroup = device.createBindGroup({
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: xBuf } },
-      { binding: 1, resource: { buffer: w.buffer } },
-      { binding: 2, resource: { buffer: yBuf } },
-      { binding: 3, resource: { buffer: uniforms } },
-    ],
-  });
-
-  const enc = device.createCommandEncoder();
-  const pass = enc.beginComputePass();
-  pass.setPipeline(pipeline);
-  pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(Math.ceil(M / 8), Math.ceil(N / 8));
-  pass.end();
-  device.queue.submit([enc.finish()]);
-
-  const result = await downloadF32(device, yBuf, M * N * 4);
-  xBuf.destroy(); yBuf.destroy(); uniforms.destroy();
-  return result;
+  const xT = uploadTensor(device, model, x, [M, K], "linear_x");
+  const yT = await linearT(device, model, xT, weightName);
+  const out = await downloadTensor(device, yT);
+  releaseTensor(model, xT); releaseTensor(model, yT);
+  return out;
 }
 
-// ---------------------------------------------------------------------
-// RoPE: rotate the last dim of x using model.cos / model.sin at time T0.
-// x has shape (N, D) where D = head_dim; cos/sin have shape
-// (rotary_seq_len, d) with d = D/2 (these buffers already live on the GPU
-// from loadModel).
-// ---------------------------------------------------------------------
+// Float32Array wrapper around ropeApplyT.
 export async function ropeApply(device, model, x, N, D, T0 = 0) {
-  if (D % 2 !== 0) throw new Error("RoPE: head_dim must be even");
-  const d = D / 2;
-  const pipeline = await getPipeline(device, model, "rope");
-  const cos = model.tensors.get("cos");
-  const sin = model.tensors.get("sin");
-  if (!cos || !sin) throw new Error("RoPE: cos/sin buffers missing from manifest");
-
-  const xBuf = uploadF32(device, "rope_x", x);
-  const yBuf = device.createBuffer({
-    label: "rope_y", size: N * D * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-  });
-  const ub = new ArrayBuffer(16);
-  const u32 = new Uint32Array(ub);
-  u32[0] = N; u32[1] = D; u32[2] = d; u32[3] = T0;
-  const uniforms = device.createBuffer({
-    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(uniforms, 0, ub);
-
-  const bindGroup = device.createBindGroup({
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: xBuf } },
-      { binding: 1, resource: { buffer: cos.buffer } },
-      { binding: 2, resource: { buffer: sin.buffer } },
-      { binding: 3, resource: { buffer: yBuf } },
-      { binding: 4, resource: { buffer: uniforms } },
-    ],
-  });
-
-  const total = N * D;
-  const enc = device.createCommandEncoder();
-  const pass = enc.beginComputePass();
-  pass.setPipeline(pipeline);
-  pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(Math.ceil(total / 64));
-  pass.end();
-  device.queue.submit([enc.finish()]);
-
-  const result = await downloadF32(device, yBuf, N * D * 4);
-  xBuf.destroy(); yBuf.destroy(); uniforms.destroy();
-  return result;
+  const xT = uploadTensor(device, model, x, [N, D], "rope_x");
+  const yT = await ropeApplyT(device, model, xT, T0);
+  const out = await downloadTensor(device, yT);
+  releaseTensor(model, xT); releaseTensor(model, yT);
+  return out;
 }
 
 // ---------------------------------------------------------------------
@@ -703,48 +576,18 @@ async function sdpaOutputGPU(device, model, attnBuf, vCacheBuf, outBuf, nH, nKV,
   uniforms.destroy();
 }
 
-// ---------------------------------------------------------------------
-// Row-wise softmax. x shape (rows, n); y same shape.
-// ---------------------------------------------------------------------
+// Float32Array wrapper around softmaxT.
 export async function softmax(device, model, x, rows, n) {
-  const pipeline = await getPipeline(device, model, "softmax");
-  const xBuf = uploadF32(device, "softmax_x", x);
-  const yBuf = device.createBuffer({
-    label: "softmax_y", size: rows * n * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-  });
-  const ub = new ArrayBuffer(16);
-  const u32 = new Uint32Array(ub);
-  u32[0] = rows; u32[1] = n;
-  const uniforms = device.createBuffer({
-    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(uniforms, 0, ub);
-  const bindGroup = device.createBindGroup({
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: xBuf } },
-      { binding: 1, resource: { buffer: yBuf } },
-      { binding: 2, resource: { buffer: uniforms } },
-    ],
-  });
-  const enc = device.createCommandEncoder();
-  const pass = enc.beginComputePass();
-  pass.setPipeline(pipeline);
-  pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(rows);
-  pass.end();
-  device.queue.submit([enc.finish()]);
-  const result = await downloadF32(device, yBuf, rows * n * 4);
-  xBuf.destroy(); yBuf.destroy(); uniforms.destroy();
-  return result;
+  const xT = uploadTensor(device, model, x, [rows, n], "softmax_x");
+  const yT = await softmaxT(device, model, xT, rows, n);
+  const out = await downloadTensor(device, yT);
+  releaseTensor(model, xT); releaseTensor(model, yT);
+  return out;
 }
 
-// ---------------------------------------------------------------------
-// Softcap: y = cap * tanh(x / cap). Element-wise unary.
-// ---------------------------------------------------------------------
+// Float32Array wrapper around softcapT.
 export async function softcap(device, model, a, cap = 15.0) {
-  return _elemUnary(device, model, "softcap", a, cap);
+  return _unWrap(device, model, "softcap", a, cap);
 }
 
 // ---------------------------------------------------------------------
@@ -1023,11 +866,11 @@ export async function mlpBlock(device, model, layerIdx, x) {
   return y;
 }
 
-export const add         = (device, model, a, b)        => _elemBinary(device, model, "add", a, b);
-export const mul         = (device, model, a, b)        => _elemBinary(device, model, "mul", a, b);
-export const scalarMul   = (device, model, a, alpha)    => _elemUnary (device, model, "scalar_mul", a, alpha);
-export const relu2       = (device, model, a)           => _elemUnary (device, model, "relu2", a);
-export const sigmoid     = (device, model, a)           => _elemUnary (device, model, "sigmoid", a);
+export const add       = (d, m, a, b)     => _binWrap(d, m, "add", a, b);
+export const mul       = (d, m, a, b)     => _binWrap(d, m, "mul", a, b);
+export const scalarMul = (d, m, a, alpha) => _unWrap (d, m, "scalar_mul", a, alpha);
+export const relu2     = (d, m, a)        => _unWrap (d, m, "relu2", a);
+export const sigmoid   = (d, m, a)        => _unWrap (d, m, "sigmoid", a);
 
 // ---------------------------------------------------------------------
 // 8. RMSNorm.
@@ -1040,45 +883,11 @@ export const sigmoid     = (device, model, a)           => _elemUnary (device, m
 // Float32Array of length n with the row normalized. Uses 1 workgroup
 // of 64 threads internally (the shader does the reduction).
 // ---------------------------------------------------------------------
+// Float32Array wrapper around rmsnormT.
 export async function rmsnorm(device, model, input, eps = 1e-5) {
-  const pipeline = await getPipeline(device, model, "rmsnorm");
-  const n = input.length;
-
-  const inBuf = uploadF32(device, "rmsnorm_in", input);
-  const outBuf = device.createBuffer({
-    label: "rmsnorm_out",
-    size: n * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-  });
-
-  // Uniform layout: u32 n; f32 eps; padding; (16-byte alignment)
-  const uniforms = device.createBuffer({
-    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
-  // Use a typed-array view: 0=u32 n, 1=f32 eps, 2..3=padding
-  const ub = new ArrayBuffer(16);
-  new Uint32Array(ub, 0, 1)[0] = n;
-  new Float32Array(ub, 4, 1)[0] = eps;
-  device.queue.writeBuffer(uniforms, 0, ub);
-
-  const bindGroup = device.createBindGroup({
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: inBuf } },
-      { binding: 1, resource: { buffer: outBuf } },
-      { binding: 2, resource: { buffer: uniforms } },
-    ],
-  });
-
-  const enc = device.createCommandEncoder();
-  const pass = enc.beginComputePass();
-  pass.setPipeline(pipeline);
-  pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(1);   // single row, single workgroup
-  pass.end();
-  device.queue.submit([enc.finish()]);
-
-  const result = await downloadF32(device, outBuf, n * 4);
-  inBuf.destroy(); outBuf.destroy(); uniforms.destroy();
-  return result;
+  const xT = uploadTensor(device, model, input, [input.length], "rmsnorm_in");
+  const yT = await rmsnormT(device, model, xT, eps);
+  const out = await downloadTensor(device, yT);
+  releaseTensor(model, xT); releaseTensor(model, yT);
+  return out;
 }
