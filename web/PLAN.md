@@ -1,74 +1,297 @@
-# WebGPU runtime — total plan
+# WebGPU runtime — implementation plan
 
-Single source of truth. One phase = one branch = one PR. Don't branch from
-any other phase (keep them linear on main). Don't add phases outside this
-list without a strong reason — the goal is to finish, not to explore.
+Everything lands on **one branch** (`web/phase-2-rmsnorm`, extended). One commit
+per phase inside that branch. Squash-merge to `main` only at the end, when the
+whole runtime works.
 
 ## Scope
 
 Run the existing **suomichat d12 SFT** model in the browser via WebGPU,
-with autoregressive generation and a basic chat UI. fp32 weights (no
-quantization, no size optimization). Correctness over speed at every step.
+with autoregressive greedy generation of a user-supplied Finnish prompt.
+fp32 weights end-to-end. Correctness over speed. No optimization, no
+quantization, no mobile, no multi-model generalisation.
 
-## Non-goals
+## Testing approach
 
-- Quantization (INT8/INT4) — deferred
-- Performance optimization (tiled matmul, fused kernels) — deferred
-- Mobile / Safari support — deferred; Chromium only
-- Training in browser — never; inference only
-- Multi-GPU in browser — never (browser runtimes are single-adapter)
-- Other suomichat model sizes (d6, d26) — only d12 targeted; trivial to swap
+All verification goes through `web/test_runtime.py`:
 
-## Phase table
+```python
+async def test_<op>(...):
+    ref = ref_<op>(...)                           # PyTorch on CPU
+    got = await run_browser_op("<op>", args)      # headless Chromium / WebGPU
+    compare(ref, got, atol=...)
+```
 
-Each phase lands on `web/phase-<N>-<name>` branch, gets its own PR.
-Acceptance criteria: `cd web && python test_runtime.py` shows all tests green.
+- Reference is plain PyTorch, always fp32, on CPU, using the actual loaded
+  suomichat model weights where relevant (so we test *our* model, not a
+  generic transformer).
+- WebGPU runs via Playwright + `test.html` in headless Chromium with
+  `--enable-unsafe-webgpu --use-vulkan` on the local RTX 6000 Ada.
+- Comparison is `max|ref - got|` under a dtype-appropriate `atol`.
 
-| # | Branch | Deliverable | Status |
-|---|---|---|---|
-| 1 | `web/phase-1-skeleton` (in commit 78dcdb3) | WebGPU init, weight loader, embedding shader, headless test harness | ✅ merged |
-| 2 | `web/phase-2-rmsnorm` (this branch) | RMSNorm shader, `rmsnorm()` export, `test_rmsnorm` | 🔨 in PR |
-| 3 | `web/phase-3-matmul` | Naive matmul shader (one thread per output element), `matmul()` export, `test_matmul` on random A (M×K) × B (K×N) | next |
-| 4 | `web/phase-4-attn-single-layer` | Attention block forward for **T=1** (no KV cache yet): c_q/c_k/c_v projections, RoPE apply, QK norm, scaled dot product with causal mask, c_proj. Test against PyTorch's single-layer attention output on a random hidden-state input. | |
-| 5 | `web/phase-5-mlp` | MLP block: c_fc matmul → `relu²` shader → c_proj matmul. Test against PyTorch MLP on random input. | |
-| 6 | `web/phase-6-block-forward` | Wire one full Block: `resid_lambdas[i] * x + x0_lambdas[i] * x0` → attn + residual → mlp + residual. Test against `model.transformer.h[0].forward(...)` on random input. | |
-| 7 | `web/phase-7-value-embeds` | ResFormer value embeddings on alternating layers: lookup `value_embeds[str(i)](idx)`, apply `ve_gate` (tiny linear + sigmoid × 3), add to V path. `has_ve(i, n_layer)` check. Test against a real block with value embeddings active. | |
-| 8 | `web/phase-8-full-forward` | All 12 blocks in a loop + `backout_lambda` subtract at the halfway mark + final norm + `lm_head` matmul + `softcap: 15 * tanh(logits / 15)`. Test: `model.forward(torch.tensor([[100]]))` vs WebGPU end-to-end on token 100. | |
-| 9 | `web/phase-9-kv-cache` | Pre-allocate K/V buffers of shape `(n_layer, max_seq_len, n_kv_head * head_dim, 2)` per layer. Each step appends new K/V. Attention now reads the full cache. Test: multi-token forward vs PyTorch `.generate()`. | |
-| 10 | `web/phase-10-smear` | `prev_embedding` buffer. From step-2 onward, apply `smear_lambda * sigmoid(smear_gate(x[..., :24])) * prev_embedding` to current embedding. Test: two-token generation matches PyTorch. | |
-| 11 | `web/phase-11-sampling-loop` | `argmax`, `top_k`, and temperature sampling shaders. JS autoregressive loop: token → forward → sample → append → repeat, until `<|assistant_end|>` or `<|bos|>`. Test: greedy sampling of 16 tokens matches PyTorch greedy. | |
-| 12 | `web/phase-12-tokenizer-ui` | Load `tokenizer.json` in browser (huggingface/tokenizers WASM OR a pure-JS BPE decoder). Add minimal chat UI: input box, conversation state with `<\|user_start\|>` / `<\|assistant_start\|>` special tokens, streaming token-by-token display. Test: end-to-end "Moi! Kuka olet?" produces Finnish output. | |
+Add one `async def test_<op>` per op. `test_runtime.py main()` dispatches all of
+them in order. A `--filter` CLI arg lets you run one test at a time while
+debugging a specific op.
 
-After Phase 12 the runtime is feature-complete for single-turn chat.
-Multi-turn conversations fall out trivially (just keep appending to the KV cache).
+**Tolerance guide (all fp32 → fp32):**
 
-## Branch / PR conventions
+| Op family | atol | Why |
+|---|---|---|
+| Embedding lookup, element-wise ops, matmul on small shapes | 0.0 | bit-exact; same order of ops in both runtimes |
+| RMSNorm, RoPE, single-matmul composites | 1e-5 | one reduction or small pipeline, no accumulation drift |
+| Single attention block | 1e-4 | softmax + multi-matmul chain; fp32 accumulation order differs between torch and our shader |
+| MLP block | 1e-5 | two matmuls + pointwise, minimal drift |
+| Full transformer block | 1e-4 | attention + MLP compounded |
+| Full 12-layer forward pass | 1e-3 | 12× composition; still well under any token-picking boundary |
+| Greedy sampling | **exact match** | argmax picks the same token even with 1e-3 drift 99.99%+ of the time; on clear-winner logits it's always identical |
 
-- Branch off latest `main` (not the previous phase branch) — avoids compounded conflicts
-- One commit per branch is fine; squash-merge into main
-- Test must pass before opening PR (`python test_runtime.py` green)
-- Each PR description should paste the test output and any interesting numerics
+## Order of phases (each = one commit on this branch)
 
-## Tolerance guide
+Each phase lists: **what** (the op), **shader file**, **runtime.js export**,
+**test function**, **PyTorch reference** (the exact thing we compare
+against), and **acceptance**.
 
-- RMSNorm, matmul, element-wise ops: `atol=1e-5` expected, often bit-exact in fp32
-- Attention (softmax + multi-matmul chain): `atol=1e-4` (fp32 accumulation drifts)
-- Full forward pass: `atol=1e-3` (compounded)
-- Sampling: compare distributions, not exact picks (unless temperature=0)
+### ✅ Phase 1 — Embedding lookup (done)
 
-## What NOT to do
+- Shader: `shaders/embedding.wgsl`
+- Runtime: `embeddingLookup(device, model, tokenId)`
+- Test: `test_embedding(model, token_id)`
+- Ref: `model.transformer.wte.weight[token_id]`
+- Acceptance: `atol=1e-5`. Observed: 0.0 (bit-exact).
 
-- Don't rewrite phase 1 or 2 shaders as "warm-up optimization" — they're
-  fine. Optimization phase lives after phase 12, if ever.
-- Don't add fp16 or INT8 yet. Whole model is fp32 end-to-end in this plan.
-- Don't generalize shaders speculatively. If a shader is called with a
-  single fixed shape today, hardcode that shape; generalize when the
-  *second* call-site appears.
-- Don't touch `suomichat/gpt.py` to make the WebGPU port easier. The
-  browser runtime must mirror the PyTorch model exactly, not vice versa.
+### ✅ Phase 2 — RMSNorm (done)
 
-## Roughly how long this takes
+- Shader: `shaders/rmsnorm.wgsl` (workgroup-shared-memory tree reduction)
+- Runtime: `rmsnorm(device, model, input, eps=1e-5)`
+- Test: `test_rmsnorm(seed=0, n=768)` and `seed=1`
+- Ref: `F.rms_norm(x, (n,), eps=1e-5)`
+- Acceptance: `atol=1e-5`. Observed: 0.0.
 
-Each phase is ~1-4 hours of focused work (shader + runtime.js plumbing +
-test + debugging numerics drift). All 10 remaining phases: ~25-40 hours.
-Parallel with learning; a phase a day is a reasonable cadence.
+### Phase 3 — Naive matmul
+
+The one op everything else uses.
+
+- **Shader**: `shaders/matmul.wgsl` — computes `C (M×N) = A (M×K) @ B (K×N)`.
+  Dispatch: `(M, N)` workgroups of 1 thread each. Each thread loops over K.
+  (Dumb, slow, correct.)
+- **Runtime**: `matmul(device, aBuf, aShape, bBuf, bShape)` — takes two
+  GPUBuffers (not CPU arrays; keeps data on-GPU for chained ops). Returns
+  output GPUBuffer. A CPU-input convenience overload for tests only.
+- **Test**: `test_matmul(seed, M, K, N)` — random A, B, compare to `A @ B`.
+  Run at M=1 K=768 N=768 (single-token projection shape) and M=768 K=768 N=2048 (MLP shape).
+- **Ref**: `ref = a @ b`
+- **Acceptance**: `atol=1e-4` (accumulation over K).
+
+### Phase 4 — Elementwise ops
+
+Three tiny shaders we need repeatedly.
+
+- **Shaders**: `add.wgsl`, `mul.wgsl`, `scalar_mul.wgsl`, `relu2.wgsl`, `sigmoid.wgsl`
+- **Runtime**: `add`, `mul`, `scalarMul`, `relu2`, `sigmoid` — all on
+  GPUBuffers, return GPUBuffers.
+- **Tests**: one per op, random inputs of shape (768,) and (1, 768)
+- **Refs**: `a + b`, `a * b`, `alpha * x`, `F.relu(x).square()`, `torch.sigmoid(x)`
+- **Acceptance**: bit-exact.
+
+### Phase 5 — RoPE apply
+
+- **Shader**: `shaders/rope.wgsl` — rotates the last dim in pairs:
+  ```
+  d = head_dim // 2
+  y[..., :d]  = x[..., :d] * cos + x[..., d:] * sin
+  y[..., d:]  = x[..., :d] * (-sin) + x[..., d:] * cos
+  ```
+- **Runtime**: `ropeApply(device, xBuf, shape, cosBuf, sinBuf, T0)` where
+  `T0` is the cache offset (0 for first token).
+- **Test**: `test_rope` with random Q shape `(1, 1, 6, 128)` and the
+  pre-computed `cos`/`sin` from the loaded model's `model.cos` buffer.
+- **Ref**: `suomichat.gpt.apply_rotary_emb(q, cos[:, T0:T0+1], sin[:, T0:T0+1])`
+- **Acceptance**: `atol=1e-5`.
+
+### Phase 6 — Single attention block (T=1, no KV cache)
+
+First real layer composite. Tests our ability to chain shaders on-GPU.
+
+- **Runtime**: `attentionBlock(device, model, layerIdx, xBuf, T0)` — reads
+  all weights for `model.transformer.h[layerIdx].attn` from the loaded
+  model, runs full forward, returns output GPUBuffer.
+  - c_q / c_k / c_v projections (matmul)
+  - reshape into heads
+  - RoPE on Q, K
+  - RMSNorm on Q, K (QK norm)
+  - scale: `q *= 1.2; k *= 1.2`
+  - softmax-based scaled dot product (T=1 = trivial; just computes
+    `softmax(qk^T/sqrt(hd)) v` over a single key/value — identity attention).
+    We'll use a real softmax + matmul via shaders; skipping FA3.
+  - c_proj matmul
+- **Shader**: `shaders/softmax.wgsl` (new, one workgroup reduction like RMSNorm)
+- **Test**: `test_attention_block_layer0` — random `x` shape `(1, 1, 768)`,
+  run our `attentionBlock` and PyTorch's `model.transformer.h[0].attn(x, None, cos_sin, (-1,0), None)`,
+  compare outputs. T0=0.
+- **Ref**: `model.transformer.h[0].attn(x_pytorch, ve=None, cos_sin=(cos[:, :1], sin[:, :1]), window_size=(-1, 0), kv_cache=None)`
+- **Acceptance**: `atol=1e-4`.
+
+*Note:* suomichat's attn block also handles `ve` (value embeddings) on
+alternating layers. Layer 0 does NOT have value embeddings
+(`has_ve(0, 12)` is False because 12 is even; see `gpt.py`), so we can
+skip them for the first attention test.
+
+### Phase 7 — Value embeddings
+
+- **Runtime**: extend `attentionBlock` to handle the `ve` path: if
+  `str(layerIdx)` is in `model.value_embeds`, lookup `value_embeds[str(layerIdx)](token_id)`,
+  compute gate via `ve_gate` (tiny linear + sigmoid × 3 scale factor),
+  `v = v + gate * ve`. Then a fresh test on a layer that has it.
+- **Test**: `test_attention_block_layer1` (first layer where `has_ve(1,12)` is True).
+- **Ref**: `model.transformer.h[1].attn(x, ve, cos_sin, (-1,0), None)` with
+  `ve = model.value_embeds['1'](token_tensor)`
+- **Acceptance**: `atol=1e-4`.
+
+### Phase 8 — MLP block
+
+- **Runtime**: `mlpBlock(device, model, layerIdx, xBuf)` — c_fc matmul →
+  relu² → c_proj matmul.
+- **Test**: `test_mlp_layer0` — random `x`, compare our output to
+  `model.transformer.h[0].mlp(x)`.
+- **Ref**: `model.transformer.h[0].mlp(x)`
+- **Acceptance**: `atol=1e-5`.
+
+### Phase 9 — Full transformer block
+
+- **Runtime**: `transformerBlock(device, model, layerIdx, xBuf, x0Buf, T0)` —
+  does the full block:
+  ```
+  x = resid_lambdas[i] * x + x0_lambdas[i] * x0
+  x = x + attentionBlock(norm(x), ve, cos_sin)
+  x = x + mlpBlock(norm(x))
+  ```
+- **Test**: `test_block_layer0` — same pattern as above, random x, x0.
+- **Ref**: `model.transformer.h[0](x, ve=None, cos_sin=..., window_size=..., kv_cache=None)`,
+  where the caller of the real block handles the `resid_lambdas * x + x0_lambdas * x0`
+  wrap — we replicate that wrap in our test ref.
+- **Acceptance**: `atol=1e-4`.
+
+### Phase 10 — Full forward pass (first token)
+
+- **Runtime**: `forward(device, model, tokenId)` — loops all 12 blocks:
+  1. embedding(tokenId) → x, also save `x0 = norm(x)`
+  2. (no smear on first token)
+  3. for i in range(n_layer):
+     - load `ve = value_embeds[str(i)](token)` if `has_ve(i, n_layer)`
+     - `x = transformerBlock(i, x, x0, T0=0)`
+     - if `i == n_layer // 2`: save `x_backout = x`
+  4. `x = x - backout_lambda * x_backout`
+  5. `x = norm(x)`
+  6. `logits = lm_head(x)`
+  7. `logits = 15.0 * tanh(logits / 15.0)` (softcap)
+  8. slice to `:vocab_size` (unpad)
+- **Shader**: `shaders/tanh_softcap.wgsl` (softcap op)
+- **Test**: `test_full_forward_first_token` — pick token_id = `<|bos|>` id,
+  compute logits via `model(torch.tensor([[bos_id]]))` and via WebGPU.
+  Compare.
+- **Ref**: `model(torch.tensor([[token_id]]))` → logits
+- **Acceptance**: `atol=1e-3`.
+
+### Phase 11 — KV cache
+
+Everything up to phase 10 was T=1 / no cache. This phase adds persistent
+K/V buffers so subsequent tokens can attend over history.
+
+- **Runtime**:
+  - `initKVCache(model, maxSeqLen)` — preallocates per-layer K/V GPUBuffers
+    of shape `(max_seq_len, n_kv_head * head_dim)`, plus a `cache_seqlens`
+    uniform.
+  - `attentionBlock(...)` updated: append new K/V to cache, attend over
+    `cache[:cache_seqlens+1]`.
+  - `forward(device, model, tokenId, cache)` — takes the cache object,
+    advances it.
+- **Test**: `test_kv_cache_two_tokens` — run greedy generation for 2 tokens
+  through both PyTorch (`model.generate([bos, x])`) and WebGPU.
+  Compare picked token IDs.
+- **Ref**: `list(model.generate([bos, token1], max_tokens=1, temperature=0))`
+- **Acceptance**: picked token IDs **match exactly** (greedy is deterministic).
+
+### Phase 12 — Smear gate
+
+Smear applies from step 2 onward (when there's a previous embedding).
+Requires a new `prev_embedding` cache buffer.
+
+- **Runtime**:
+  - Add `prev_embedding` to the cache object.
+  - Before the transformer blocks, if `prev_embedding is not None`:
+    ```
+    gate = smear_lambda * sigmoid(smear_gate(x[:, :, :24]))
+    x = x + gate * prev_embedding
+    ```
+  - After the pass: update `prev_embedding = x[:, -1:, :]` (post-norm).
+- **Test**: `test_smear_two_tokens` — same as test_kv_cache_two_tokens but
+  verifying that smear applies on the second token.
+- **Ref**: PyTorch's `model.forward` with `kv_cache` populated.
+- **Acceptance**: picked token IDs match exactly.
+
+### Phase 13 — Sampling + generation loop
+
+- **Runtime**:
+  - `argmax(device, logitsBuf, vocabSize)` shader — returns a single u32.
+  - `generate(device, model, promptTokens, maxTokens, temperature=0.0)` —
+    JavaScript autoregressive loop. Calls `forward(...)` per token,
+    extracts last-position logits, picks, appends, repeats. Stops at
+    `<|assistant_end|>` or `<|bos|>` or maxTokens.
+- **Test**: `test_greedy_generate_16` — prompt the model with a short
+  token sequence, generate 16 tokens via WebGPU and via PyTorch greedy.
+  Token sequences must match.
+- **Ref**: `list(model.generate(prompt_tokens, max_tokens=16, temperature=0))`
+- **Acceptance**: exact match on all 16 tokens.
+
+### Phase 14 — Tokenizer + chat UI
+
+- **Runtime**:
+  - Load `tokenizer.json` via the `@huggingface/tokenizers` WASM build
+    (pinned version).
+  - `encode(text)` / `decode(ids)`.
+  - Helper that builds a chat conversation:
+    ```
+    tokens = [bos, user_start, ...encode(userMsg), user_end, assistant_start]
+    ```
+- **UI** (extends `index.html`):
+  - Input textarea + Submit button
+  - Streaming token display (per-token `decode` for new token only)
+  - Stop button (aborts the generation loop cleanly)
+- **Test**: `test_end_to_end` — tokenize "Moi! Kuka olet?", generate 50 tokens
+  via WebGPU greedy, compare final decoded string character-for-character to
+  PyTorch greedy.
+- **Ref**: PyTorch `chat_cli.py` equivalent path with `temperature=0`, `top_k=1`.
+- **Acceptance**: identical output strings.
+
+## Single branch workflow
+
+```
+git checkout web/phase-2-rmsnorm
+
+# For each phase:
+#   write shader + runtime + test
+#   python test_runtime.py (narrow to one test with --filter=<name>)
+#   iterate until green
+#   git add + commit with message "Phase N: <op>"
+#   git push
+
+# After phase 14 is green:
+gh pr create --base main --head web/phase-2-rmsnorm \
+    --title "WebGPU runtime for d12 SFT (Phases 1-14)" \
+    --body "see web/PLAN.md"
+
+# User squash-merges to main.
+```
+
+## What we're deliberately leaving out
+
+(Already stated; listing for clarity.)
+
+- fp16/INT8/INT4 — after phase 14 if at all
+- Tiled matmul / fused kernels — never, in this project
+- Sliding window attention — model was trained with SSSL but for browser
+  we use full causal attention (will produce numerically different but
+  functionally correct output; retrain with `--window-pattern=L` if you
+  want exact parity)
+- Multi-turn conversation state in the UI — trivial extension after
+  phase 14; out of scope for the plan
