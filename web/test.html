@@ -14,7 +14,7 @@ which the Python driver invokes.</p>
 <pre id="status">Initialising…</pre>
 
 <script type="module">
-import { initWebGPU, loadModel, embeddingLookup, rmsnorm } from "./runtime.js";
+import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul } from "./runtime.js";
 
 const status = document.getElementById("status");
 
@@ -40,6 +40,12 @@ const status = document.getElementById("status");
           const input = new Float32Array(args.input);
           const eps = args.eps ?? 1e-5;
           const result = await rmsnorm(device, model, input, eps);
+          return Array.from(result);
+        }
+        case "matmul": {
+          const a = new Float32Array(args.a);
+          const b = new Float32Array(args.b);
+          const result = await matmul(device, model, a, args.aShape, b, args.bShape);
           return Array.from(result);
         }
         default:

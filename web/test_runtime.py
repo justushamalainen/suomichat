@@ -48,6 +48,11 @@ def ref_rmsnorm(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     return torch.nn.functional.rms_norm(x, (x.size(-1),), eps=eps)
 
 
+def ref_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """PyTorch reference for row-major fp32 matmul: C = A @ B."""
+    return a @ b
+
+
 # ----------------------------------------------------------------------
 # Headless Chrome driver
 # ----------------------------------------------------------------------
@@ -117,6 +122,36 @@ async def test_embedding(model, token_id: int, atol: float = 1e-5):
         return False
 
 
+async def test_matmul(seed: int = 0, M: int = 1, K: int = 768, N: int = 768, atol: float = 5e-4):
+    print(f"--- test: matmul ({M}x{K}) @ ({K}x{N})  seed={seed} ---")
+    g = torch.Generator().manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.float32, generator=g)
+    b = torch.randn(K, N, dtype=torch.float32, generator=g)
+    ref = ref_matmul(a, b).numpy()
+
+    got = await run_browser_op("matmul", {
+        "a": a.flatten().tolist(),
+        "aShape": [M, K],
+        "b": b.flatten().tolist(),
+        "bShape": [K, N],
+    })
+    got = torch.tensor(got, dtype=torch.float32).view(M, N).numpy()
+
+    if got.shape != ref.shape:
+        print(f"  SHAPE MISMATCH: ref={ref.shape}, got={got.shape}")
+        return False
+    diff = abs(ref - got).max()
+    rel = diff / (abs(ref).max() + 1e-12)
+    print(f"  max abs diff: {diff:.3e}  rel: {rel:.3e}  (tol {atol:.0e})")
+    print(f"  ref[0, :6]: {ref[0, :6]}")
+    print(f"  got[0, :6]: {got[0, :6]}")
+    if diff < atol:
+        print("  ✓ PASS")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_rmsnorm(seed: int = 0, n: int = 768, atol: float = 1e-5):
     print(f"--- test: rmsnorm (n={n}, seed={seed}) ---")
     g = torch.Generator().manual_seed(seed)
@@ -159,9 +194,12 @@ async def main():
     passed = []
     passed.append(await test_embedding(model, args.token_id))
     passed.append(await test_rmsnorm(seed=0, n=768))
-    passed.append(await test_rmsnorm(seed=1, n=768))   # different input, sanity check
+    passed.append(await test_rmsnorm(seed=1, n=768))
+    passed.append(await test_matmul(seed=0, M=1, K=768, N=768))       # shape: Q projection on one token
+    passed.append(await test_matmul(seed=1, M=768, K=768, N=2048))    # shape: MLP c_fc
+    passed.append(await test_matmul(seed=2, M=2, K=3, N=4))           # tiny sanity check
 
-    # Future: test_matmul, test_attention, test_full_forward, etc.
+    # Future: test_rope, test_attention, test_full_forward, etc.
 
     n_pass = sum(passed)
     n_total = len(passed)

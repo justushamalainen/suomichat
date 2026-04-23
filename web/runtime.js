@@ -189,7 +189,61 @@ export async function embeddingLookup(device, model, tokenId) {
 }
 
 // ---------------------------------------------------------------------
-// 7. RMSNorm.
+// 7. Matmul: C (M×N) = A (M×K) @ B (K×N), row-major f32.
+// ---------------------------------------------------------------------
+//
+// Takes Float32Array inputs for a test-friendly API. Internally uploads
+// to GPU, dispatches the matmul shader, reads back the result. Future
+// phases will want a pure-GPU variant (aBuf, bBuf → cBuf) so we don't
+// round-trip through CPU; we add that when the first non-test caller
+// appears.
+// ---------------------------------------------------------------------
+export async function matmul(device, model, a, aShape, b, bShape) {
+  const [M, K] = aShape;
+  const [K2, N] = bShape;
+  if (K !== K2) throw new Error(`matmul shape mismatch: (${M},${K}) @ (${K2},${N})`);
+
+  const pipeline = await getPipeline(device, model, "matmul");
+  const aBuf = uploadF32(device, "matmul_a", a);
+  const bBuf = uploadF32(device, "matmul_b", b);
+  const cBuf = device.createBuffer({
+    label: "matmul_c", size: M * N * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+
+  const ub = new ArrayBuffer(16);
+  const u32 = new Uint32Array(ub);
+  u32[0] = M; u32[1] = K; u32[2] = N;
+  const uniforms = device.createBuffer({
+    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(uniforms, 0, ub);
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: aBuf } },
+      { binding: 1, resource: { buffer: bBuf } },
+      { binding: 2, resource: { buffer: cBuf } },
+      { binding: 3, resource: { buffer: uniforms } },
+    ],
+  });
+
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(M / 8), Math.ceil(N / 8));
+  pass.end();
+  device.queue.submit([enc.finish()]);
+
+  const result = await downloadF32(device, cBuf, M * N * 4);
+  aBuf.destroy(); bBuf.destroy(); cBuf.destroy(); uniforms.destroy();
+  return result;
+}
+
+// ---------------------------------------------------------------------
+// 8. RMSNorm.
 // ---------------------------------------------------------------------
 //
 // Equivalent in PyTorch:

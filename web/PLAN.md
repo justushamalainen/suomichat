@@ -80,7 +80,7 @@ The one op everything else uses.
 - **Test**: `test_matmul(seed, M, K, N)` — random A, B, compare to `A @ B`.
   Run at M=1 K=768 N=768 (single-token projection shape) and M=768 K=768 N=2048 (MLP shape).
 - **Ref**: `ref = a @ b`
-- **Acceptance**: `atol=1e-4` (accumulation over K).
+- **Acceptance**: `atol=5e-4` (fp32 accumulation order differs from torch; relative error stays ~1e-6).
 
 ### Phase 4 — Elementwise ops
 
