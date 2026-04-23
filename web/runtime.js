@@ -762,17 +762,15 @@ export async function forwardT(device, model, tokenId, cache = null) {
       if (model.smearLambda === undefined) {
         model.smearLambda = (await downloadF32(device, model.tensors.get("smear_lambda").buffer, 4))[0];
       }
-      const gateRaw    = await linearT  (device, model, x, "smear_gate.weight");          // (1, 1)
+      const gateRaw    = await linearT  (device, model, x, "smear_gate.weight");
       const gateSig    = await sigmoidT (device, model, gateRaw); releaseTensor(model, gateRaw);
       const gateScaled = await scalarMulT(device, model, gateSig, model.smearLambda); releaseTensor(model, gateSig);
-      // gateScaled is shape (1,1) (one float). Need to broadcast across n_embd.
-      // Cheapest hack: download the one float, fill a Tensor.
-      const g = (await downloadTensor(device, gateScaled))[0];
+      // smear_apply does x[i] += gate_scalar[0] * prev[i] in place — no CPU sync.
+      const pipeline = await getPipeline(device, model, "smear_apply");
+      const u = _writeUniforms(device, model, [n_embd]);
+      _dispatch(device, pipeline, [gateScaled.buffer, xPreSmear.buffer, x.buffer], u, [Math.ceil(n_embd / 64)]);
+      _ensurePool(model).release(u);
       releaseTensor(model, gateScaled);
-      const broadcast = uploadTensor(device, model, new Float32Array(n_embd).fill(g), [1, n_embd], "smear_bcast");
-      const smeared = await mulT(device, model, broadcast, xPreSmear); releaseTensor(model, broadcast);
-      const newX = await addT(device, model, x, smeared); releaseTensor(model, smeared);
-      releaseTensor(model, x); x = newX;
       releaseTensor(model, xPreSmear);
     }
   }

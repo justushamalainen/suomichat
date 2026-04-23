@@ -711,6 +711,17 @@ async def main():
     passed.append(await test_tokenizer_render("Moi! Kuka olet?"))
     passed.append(await test_chat_e2e(model, "Moi! Kuka olet?", max_new=8))
 
+    # Bench the new GPU-only forward path vs the legacy Float32Array path.
+    # Not assertive — just prints timings.
+    print("--- bench: forwardT (GPU-only path) ---")
+    new_b = await run_browser_op("bench_forward", {"tokenId": 100, "N": 30, "legacy": False})
+    print(f"  N={new_b['N']} total={new_b['ms']:.0f} ms  =>  {new_b['msPerToken']:.1f} ms/token")
+    print("--- bench: _forward_legacy (Float32Array round-trips) ---")
+    old_b = await run_browser_op("bench_forward", {"tokenId": 100, "N": 30, "legacy": True})
+    print(f"  N={old_b['N']} total={old_b['ms']:.0f} ms  =>  {old_b['msPerToken']:.1f} ms/token")
+    speedup = old_b['ms'] / new_b['ms']
+    print(f"  speedup: {speedup:.1f}x")
+
     n_pass = sum(passed)
     n_total = len(passed)
     print(f"\n{n_pass}/{n_total} tests passed")

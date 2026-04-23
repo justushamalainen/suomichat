@@ -17,7 +17,8 @@ which the Python driver invokes.</p>
 import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul, linear,
          add, mul, scalarMul, relu2, sigmoid, ropeApply, mlpBlock,
          attentionBlock, transformerBlock, forward, softmax,
-         initKVCache, destroyKVCache, greedyGenerate } from "./runtime.js";
+         initKVCache, destroyKVCache, greedyGenerate,
+         forwardT, releaseTensor, _forward_legacy } from "./runtime.js";
 import { loadTokenizer, decodeTokens, encodeOrdinary, renderForCompletion } from "./tokenizer.js";
 
 const status = document.getElementById("status");
@@ -121,6 +122,36 @@ const status = document.getElementById("status");
         case "greedy_generate": {
           // promptTokens (array of int), maxNew (int) → full token list.
           return await greedyGenerate(device, model, args.promptTokens, args.maxNew, args.maxSeqLen);
+        }
+        case "bench_forward": {
+          // Measure ms/token for the GPU-only forwardT path vs the
+          // legacy Float32Array round-tripping forward. Returns total
+          // wall-clock for N iterations + the per-token average.
+          const N = args.N ?? 50;
+          const tokenId = args.tokenId ?? 100;
+          const useLegacy = !!args.legacy;
+          const cache = initKVCache(device, model, N + 8);
+          // warmup (compiles pipelines, fills pool)
+          if (useLegacy) {
+            await _forward_legacy(device, model, tokenId, cache);
+          } else {
+            const t = await forwardT(device, model, tokenId, cache);
+            releaseTensor(model, t);
+          }
+          await device.queue.onSubmittedWorkDone();
+          const t0 = performance.now();
+          for (let i = 0; i < N; i++) {
+            if (useLegacy) {
+              await _forward_legacy(device, model, tokenId, cache);
+            } else {
+              const t = await forwardT(device, model, tokenId, cache);
+              releaseTensor(model, t);
+            }
+          }
+          await device.queue.onSubmittedWorkDone();
+          const dt = performance.now() - t0;
+          destroyKVCache(cache);
+          return { ms: dt, N, msPerToken: dt / N, legacy: useLegacy };
         }
         case "two_tokens": {
           // Run forward(t0, cache) then forward(t1, cache); return final logits.
