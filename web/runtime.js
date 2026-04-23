@@ -471,6 +471,134 @@ export async function ropeApply(device, model, x, N, D, T0 = 0) {
 }
 
 // ---------------------------------------------------------------------
+// KV cache: pre-allocated per-layer K, V buffers + seqlens counter.
+// Used by attentionBlock when passed; enables multi-token generation.
+// ---------------------------------------------------------------------
+export function initKVCache(device, model, maxSeqLen) {
+  const cfg = model.config;
+  const head_dim = cfg.n_embd / cfg.n_head;
+  const kvDim = cfg.n_kv_head * head_dim;
+  const bytes = maxSeqLen * kvDim * 4;
+
+  const cache = {
+    maxSeqLen,
+    seqlens: 0,
+    kBuffers: [],
+    vBuffers: [],
+    prevEmbedding: null,   // for smear
+  };
+  for (let i = 0; i < cfg.n_layer; i++) {
+    cache.kBuffers.push(device.createBuffer({
+      label: `k_cache_${i}`, size: bytes,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    }));
+    cache.vBuffers.push(device.createBuffer({
+      label: `v_cache_${i}`, size: bytes,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    }));
+  }
+  return cache;
+}
+
+export function destroyKVCache(cache) {
+  for (const b of cache.kBuffers) b.destroy();
+  for (const b of cache.vBuffers) b.destroy();
+}
+
+// ---------------------------------------------------------------------
+// Internal: pure-GPU SDPA pieces, used by attention-with-cache path.
+// These keep data on-GPU between stages, unlike the test-friendly
+// softmax() helper above.
+// ---------------------------------------------------------------------
+async function sdpaScoresGPU(device, model, qBuf, kCacheBuf, scoresBuf, nH, nKV, hd, Tk) {
+  const pipeline = await getPipeline(device, model, "sdpa_scores");
+  const ub = new ArrayBuffer(32);
+  const u32 = new Uint32Array(ub);
+  const f32 = new Float32Array(ub);
+  u32[0] = nH; u32[1] = nKV; u32[2] = hd; u32[3] = Tk;
+  f32[4] = 1.0 / Math.sqrt(hd);
+  const uniforms = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(uniforms, 0, ub);
+  const bg = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: qBuf } },
+      { binding: 1, resource: { buffer: kCacheBuf } },
+      { binding: 2, resource: { buffer: scoresBuf } },
+      { binding: 3, resource: { buffer: uniforms } },
+    ],
+  });
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bg);
+  pass.dispatchWorkgroups(Math.ceil(nH / 8), Math.ceil(Tk / 8));
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  uniforms.destroy();
+}
+
+async function softmaxRowsGPU(device, model, scoresBuf, rows, n) {
+  const pipeline = await getPipeline(device, model, "softmax");
+  const ub = new ArrayBuffer(16);
+  const u32 = new Uint32Array(ub);
+  u32[0] = rows; u32[1] = n;
+  const uniforms = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(uniforms, 0, ub);
+  // softmax.wgsl reads x and writes y to different buffers. Use a tmp.
+  const tmp = device.createBuffer({
+    size: rows * n * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+  });
+  const enc0 = device.createCommandEncoder();
+  enc0.copyBufferToBuffer(scoresBuf, 0, tmp, 0, rows * n * 4);
+  device.queue.submit([enc0.finish()]);
+
+  const bg = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: tmp } },
+      { binding: 1, resource: { buffer: scoresBuf } },
+      { binding: 2, resource: { buffer: uniforms } },
+    ],
+  });
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bg);
+  pass.dispatchWorkgroups(rows);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  tmp.destroy(); uniforms.destroy();
+}
+
+async function sdpaOutputGPU(device, model, attnBuf, vCacheBuf, outBuf, nH, nKV, hd, Tk) {
+  const pipeline = await getPipeline(device, model, "sdpa_output");
+  const ub = new ArrayBuffer(16);
+  const u32 = new Uint32Array(ub);
+  u32[0] = nH; u32[1] = nKV; u32[2] = hd; u32[3] = Tk;
+  const uniforms = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(uniforms, 0, ub);
+  const bg = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: attnBuf } },
+      { binding: 1, resource: { buffer: vCacheBuf } },
+      { binding: 2, resource: { buffer: outBuf } },
+      { binding: 3, resource: { buffer: uniforms } },
+    ],
+  });
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bg);
+  pass.dispatchWorkgroups(Math.ceil(nH / 8), Math.ceil(hd / 8));
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  uniforms.destroy();
+}
+
+// ---------------------------------------------------------------------
 // Row-wise softmax. x shape (rows, n); y same shape.
 // ---------------------------------------------------------------------
 export async function softmax(device, model, x, rows, n) {
@@ -518,17 +646,43 @@ export async function softcap(device, model, a, cap = 15.0) {
 // Full forward pass for a single token. No KV cache (fresh state).
 // Returns logits (vocab_size,).
 // ---------------------------------------------------------------------
-export async function forward(device, model, tokenId) {
+export async function forward(device, model, tokenId, cache = null) {
   const cfg = model.config;
   const n_layer = cfg.n_layer;
   const n_embd = cfg.n_embd;
+  const T0 = cache ? cache.seqlens : 0;
 
-  // 1. Embedding + norm + save x0
+  // 1. Embedding + norm
   let x = await embeddingLookup(device, model, tokenId);
   x = await rmsnorm(device, model, x);
-  const x0 = new Float32Array(x);   // snapshot the initial normalised embedding
 
-  // 2. Transformer blocks (no smear on first token — cache is fresh)
+  // 1b. Smear (decode T=1). PyTorch reference (gpt.py ~l.435):
+  //       x_pre_smear = cache.prev_embedding
+  //       cache.prev_embedding = x                   # store POST-norm PRE-smear
+  //       if x_pre_smear is not None:
+  //           gate = smear_lambda * sigmoid(smear_gate(x[..., :24]))
+  //           x = x + gate * x_pre_smear
+  if (cache) {
+    const xPreSmear = cache.prevEmbedding;
+    cache.prevEmbedding = new Float32Array(x);
+
+    if (xPreSmear !== null) {
+      if (model.smearLambda === undefined) {
+        model.smearLambda = (await downloadF32(device, model.tensors.get("smear_lambda").buffer, 4))[0];
+      }
+      const xHead = x.slice(0, 24);
+      const gateRaw = await linear(device, model, xHead, 1, 24, "smear_gate.weight");
+      const gateSig = await sigmoid(device, model, gateRaw);
+      const gateScaled = await scalarMul(device, model, gateSig, model.smearLambda);
+      const gateBroadcast = new Float32Array(n_embd).fill(gateScaled[0]);
+      const smeared = await mul(device, model, gateBroadcast, xPreSmear);
+      x = await add(device, model, x, smeared);
+    }
+  }
+
+  const x0 = new Float32Array(x);   // x0 baseline = post-smear normalized embedding
+
+  // 2. Transformer blocks
   const backoutIdx = Math.floor(n_layer / 2);
   let xBackout = null;
   for (let i = 0; i < n_layer; i++) {
@@ -537,9 +691,11 @@ export async function forward(device, model, tokenId) {
     if (model.tensors.has(veName)) {
       ve = await embeddingLookupNamed(device, model, veName, tokenId);
     }
-    x = await transformerBlock(device, model, i, x, x0, 0, ve);
+    x = await transformerBlock(device, model, i, x, x0, T0, ve, cache);
     if (i === backoutIdx) xBackout = new Float32Array(x);
   }
+
+  if (cache) cache.seqlens += 1;
 
   // 3. Backout subtract: x = x - backout_lambda * x_backout
   if (xBackout !== null) {
@@ -576,7 +732,7 @@ async function ensureScalars(device, model) {
   model.x0Lambdas    = await downloadF32(device, model.tensors.get("x0_lambdas").buffer,    n * 4);
 }
 
-export async function transformerBlock(device, model, layerIdx, x, x0, T0 = 0, ve = null) {
+export async function transformerBlock(device, model, layerIdx, x, x0, T0 = 0, ve = null, cache = null) {
   await ensureScalars(device, model);
   const residL = model.residLambdas[layerIdx];
   const x0L    = model.x0Lambdas[layerIdx];
@@ -588,7 +744,7 @@ export async function transformerBlock(device, model, layerIdx, x, x0, T0 = 0, v
 
   // 2. Attention + residual
   const xn    = await rmsnorm(device, model, cur);
-  const ao    = await attentionBlock(device, model, layerIdx, xn, T0, ve);
+  const ao    = await attentionBlock(device, model, layerIdx, xn, T0, ve, cache);
   cur         = await add(device, model, cur, ao);
 
   // 3. MLP + residual
@@ -612,7 +768,7 @@ export async function transformerBlock(device, model, layerIdx, x, x0, T0 = 0, v
 // What it DOES validate: Q/K/V projections, head-wise RoPE, head-wise
 // QK norm, per-layer value embedding hookup (Phase 7), c_proj chain.
 // ---------------------------------------------------------------------
-export async function attentionBlock(device, model, layerIdx, x, T0 = 0, ve = null) {
+export async function attentionBlock(device, model, layerIdx, x, T0 = 0, ve = null, cache = null) {
   const prefix = `transformer.h.${layerIdx}.attn`;
   const cfg = model.config;
   const n_embd = cfg.n_embd;
@@ -670,12 +826,38 @@ export async function attentionBlock(device, model, layerIdx, x, T0 = 0, ve = nu
   const qS = await scalarMul(device, model, qN, 1.2);
   const kS = await scalarMul(device, model, kN, 1.2);
 
-  // 6. SDPA for T=1: output = v (softmax over single key = 1.0).
-  //    Phase 11 will replace this with a proper softmax + matmul chain.
-  //    qS and kS are computed but intentionally unused here — they'll
-  //    participate once we have T_k > 1.
-  void qS; void kS;
-  const attnOut = v;   // shape (M, n_head * head_dim)
+  // 6. SDPA.
+  //    Without cache (Phase 6 original path): T=1 → output = v.
+  //    With cache: append new K/V at cache.seqlens, then run SDPA over [0..seqlens+1].
+  let attnOut;
+  if (cache === null) {
+    attnOut = v;
+  } else {
+    // Append current k, v to cache at position cache.seqlens
+    const kvDim = n_kv * head_dim;
+    const writeOffset = cache.seqlens * kvDim * 4;
+    device.queue.writeBuffer(cache.kBuffers[layerIdx], writeOffset, kS.buffer, kS.byteOffset, kS.byteLength);
+    device.queue.writeBuffer(cache.vBuffers[layerIdx], writeOffset, v.buffer,  v.byteOffset,  v.byteLength);
+    const Tk = cache.seqlens + 1;
+
+    // Allocate scratch buffers for this step
+    const qBuf    = uploadF32(device, "sdpa_q", qS);
+    const scBuf   = device.createBuffer({
+      size: n_head * Tk * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    });
+    const outBuf  = device.createBuffer({
+      size: n_head * head_dim * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+
+    await sdpaScoresGPU (device, model, qBuf, cache.kBuffers[layerIdx], scBuf, n_head, n_kv, head_dim, Tk);
+    await softmaxRowsGPU(device, model, scBuf, n_head, Tk);
+    await sdpaOutputGPU (device, model, scBuf, cache.vBuffers[layerIdx], outBuf, n_head, n_kv, head_dim, Tk);
+
+    attnOut = await downloadF32(device, outBuf, n_head * head_dim * 4);
+    qBuf.destroy(); scBuf.destroy(); outBuf.destroy();
+  }
 
   // 7. c_proj
   return await linear(device, model, attnOut, M, n_embd, `${prefix}.c_proj.weight`);

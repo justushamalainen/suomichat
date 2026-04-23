@@ -16,7 +16,8 @@ which the Python driver invokes.</p>
 <script type="module">
 import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul, linear,
          add, mul, scalarMul, relu2, sigmoid, ropeApply, mlpBlock,
-         attentionBlock, transformerBlock, forward, softmax } from "./runtime.js";
+         attentionBlock, transformerBlock, forward, softmax,
+         initKVCache, destroyKVCache } from "./runtime.js";
 
 const status = document.getElementById("status");
 
@@ -101,6 +102,15 @@ const status = document.getElementById("status");
         }
         case "softmax": {
           const r = await softmax(device, model, new Float32Array(args.x), args.rows, args.n);
+          return Array.from(r);
+        }
+        case "two_tokens": {
+          // Run forward(t0, cache) then forward(t1, cache); return final logits.
+          // Exercises KV cache + smear (smear fires on the 2nd call).
+          const cache = initKVCache(device, model, args.maxSeqLen ?? 32);
+          await forward(device, model, args.t0, cache);
+          const r = await forward(device, model, args.t1, cache);
+          destroyKVCache(cache);
           return Array.from(r);
         }
         default:

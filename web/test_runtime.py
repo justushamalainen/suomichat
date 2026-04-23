@@ -268,6 +268,49 @@ async def test_full_forward(model, token_id: int = 100, atol: float = 0.3):
     return False
 
 
+async def test_kv_cache_two_tokens(model, t0: int = 100, t1: int = 7, atol: float = 0.5):
+    """Two-step decode with KV cache + smear gate (smear fires on step 2).
+    Compares the WebGPU position-1 logits to PyTorch's logits[0, 1]
+    from a single 2-token forward (which exercises the same SDPA, smear,
+    x0 paths but in prefill form).
+
+    Acceptance: argmax must match exactly + abs diff under `atol`.
+    `atol` here is more permissive than single-token (0.3) because the
+    two paths differ structurally — PyTorch prefill computes both
+    positions in one batched matmul, while WebGPU decode runs each token
+    through its own per-step SDPA over a growing KV cache. Pure fp32
+    accumulation order accounts for ~1% relative drift across 12 layers.
+    """
+    print(f"--- test: kv_cache_two_tokens t0={t0} t1={t1} ---")
+    tokens = torch.tensor([[t0, t1]])
+    with torch.no_grad():
+        logits_all = model(tokens).cpu().float().numpy()
+    ref = logits_all[0, 1]    # position-1 logits
+
+    got = await run_browser_op("two_tokens", {"t0": t0, "t1": t1, "maxSeqLen": 32})
+    got = torch.tensor(got, dtype=torch.float32).numpy()
+
+    if got.shape != ref.shape:
+        print(f"  SHAPE MISMATCH: ref={ref.shape}, got={got.shape}")
+        return False
+
+    diff = abs(ref - got).max()
+    rel = diff / (abs(ref).max() + 1e-12)
+    ref_argmax = int(ref.argmax())
+    got_argmax = int(got.argmax())
+    ref_top3 = ref.argsort()[-3:][::-1].tolist()
+    got_top3 = got.argsort()[-3:][::-1].tolist()
+    print(f"  max abs diff: {diff:.3e}  rel: {rel:.3e}  (tol {atol:.2f})")
+    print(f"  argmax — ref: {ref_argmax}  got: {got_argmax}  {'MATCH' if ref_argmax == got_argmax else 'MISMATCH'}")
+    print(f"  top-3 ref: {ref_top3}  got: {got_top3}")
+    ok = diff <= atol and ref_argmax == got_argmax
+    if ok:
+        print("  ✓ PASS")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_transformer_block(model, layer_idx: int = 0, seed: int = 0, atol: float = 5e-4):
     """Full block: resid_lambda mix + attn + mlp + residuals. Against model.transformer.h[i]."""
     from suomichat.gpt import has_ve
@@ -511,8 +554,10 @@ async def main():
     passed.append(await test_full_forward(model, token_id=7))
     passed.append(await test_softmax(seed=0, rows=6, n=64))
     passed.append(await test_softmax(seed=1, rows=6, n=1))    # trivial 1-element softmax = 1.0
+    passed.append(await test_kv_cache_two_tokens(model, t0=100, t1=7))
+    passed.append(await test_kv_cache_two_tokens(model, t0=42, t1=42))  # repeat token edge
 
-    # Future: test_kv_cache_two_tokens, test_greedy_generate_16, etc.
+    # Future: test_greedy_generate_16, etc.
 
     n_pass = sum(passed)
     n_total = len(passed)
