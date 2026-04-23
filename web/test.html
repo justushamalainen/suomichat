@@ -16,7 +16,7 @@ which the Python driver invokes.</p>
 <script type="module">
 import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul, linear,
          add, mul, scalarMul, relu2, sigmoid, ropeApply, mlpBlock,
-         attentionBlock, transformerBlock, forward } from "./runtime.js";
+         attentionBlock, transformerBlock, forward, softmax } from "./runtime.js";
 
 const status = document.getElementById("status");
 
@@ -97,6 +97,10 @@ const status = document.getElementById("status");
         }
         case "full_forward": {
           const r = await forward(device, model, args.tokenId);
+          return Array.from(r);
+        }
+        case "softmax": {
+          const r = await softmax(device, model, new Float32Array(args.x), args.rows, args.n);
           return Array.from(r);
         }
         default:

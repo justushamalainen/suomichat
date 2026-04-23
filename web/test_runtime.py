@@ -207,6 +207,26 @@ async def test_elementwise(seed: int = 0, n: int = 768):
     return all(results)
 
 
+async def test_softmax(seed: int = 0, rows: int = 6, n: int = 64, atol: float = 1e-5):
+    print(f"--- test: softmax (rows={rows}, n={n}, seed={seed}) ---")
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(rows, n, dtype=torch.float32, generator=g)
+    ref = torch.softmax(x, dim=-1).numpy()
+    got = await run_browser_op("softmax", {
+        "x": x.flatten().tolist(), "rows": rows, "n": n,
+    })
+    got = torch.tensor(got, dtype=torch.float32).view(rows, n).numpy()
+    diff = abs(ref - got).max()
+    row_sums = got.sum(axis=-1)
+    print(f"  max abs diff: {diff:.3e}  (tol {atol:.0e})")
+    print(f"  row sums (should all be ~1): min={row_sums.min():.6f} max={row_sums.max():.6f}")
+    if diff <= atol:
+        print("  ✓ PASS")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_full_forward(model, token_id: int = 100, atol: float = 0.3):
     """Run the full 12-layer forward for a single token. Compare to
     PyTorch's first-position logits from a 2-token forward (so the
@@ -489,6 +509,8 @@ async def main():
     passed.append(await test_transformer_block(model, layer_idx=1))
     passed.append(await test_full_forward(model, token_id=100))
     passed.append(await test_full_forward(model, token_id=7))
+    passed.append(await test_softmax(seed=0, rows=6, n=64))
+    passed.append(await test_softmax(seed=1, rows=6, n=1))    # trivial 1-element softmax = 1.0
 
     # Future: test_kv_cache_two_tokens, test_greedy_generate_16, etc.
 

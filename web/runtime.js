@@ -471,6 +471,43 @@ export async function ropeApply(device, model, x, N, D, T0 = 0) {
 }
 
 // ---------------------------------------------------------------------
+// Row-wise softmax. x shape (rows, n); y same shape.
+// ---------------------------------------------------------------------
+export async function softmax(device, model, x, rows, n) {
+  const pipeline = await getPipeline(device, model, "softmax");
+  const xBuf = uploadF32(device, "softmax_x", x);
+  const yBuf = device.createBuffer({
+    label: "softmax_y", size: rows * n * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  const ub = new ArrayBuffer(16);
+  const u32 = new Uint32Array(ub);
+  u32[0] = rows; u32[1] = n;
+  const uniforms = device.createBuffer({
+    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(uniforms, 0, ub);
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: xBuf } },
+      { binding: 1, resource: { buffer: yBuf } },
+      { binding: 2, resource: { buffer: uniforms } },
+    ],
+  });
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(rows);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  const result = await downloadF32(device, yBuf, rows * n * 4);
+  xBuf.destroy(); yBuf.destroy(); uniforms.destroy();
+  return result;
+}
+
+// ---------------------------------------------------------------------
 // Softcap: y = cap * tanh(x / cap). Element-wise unary.
 // ---------------------------------------------------------------------
 export async function softcap(device, model, a, cap = 15.0) {
