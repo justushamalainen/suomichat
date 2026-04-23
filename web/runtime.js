@@ -482,7 +482,8 @@ export function initKVCache(device, model, maxSeqLen) {
     seqlens: 0,
     kBuffers: [],
     vBuffers: [],
-    prevEmbedding: null,   // for smear
+    prevEmbedding: null,    // legacy Float32Array slot (used by old forward())
+    prevEmbeddingT: null,   // GPU Tensor slot (used by forwardT)
   };
   for (let i = 0; i < cfg.n_layer; i++) {
     cache.kBuffers.push(device.createBuffer({
@@ -500,6 +501,7 @@ export function initKVCache(device, model, maxSeqLen) {
 export function destroyKVCache(cache) {
   for (const b of cache.kBuffers) b.destroy();
   for (const b of cache.vBuffers) b.destroy();
+  if (cache.prevEmbeddingT) cache.prevEmbeddingT.buffer.destroy?.();
 }
 
 // ---------------------------------------------------------------------
@@ -613,7 +615,9 @@ export async function softcap(device, model, a, cap = 15.0) {
 // Full forward pass for a single token. No KV cache (fresh state).
 // Returns logits (vocab_size,).
 // ---------------------------------------------------------------------
-export async function forward(device, model, tokenId, cache = null) {
+// LEGACY forward — kept for tests that drove the Float32Array smear cache.
+// New callers should use forwardT directly.
+export async function _forward_legacy(device, model, tokenId, cache = null) {
   const cfg = model.config;
   const n_layer = cfg.n_layer;
   const n_embd = cfg.n_embd;
@@ -683,6 +687,138 @@ export async function forward(device, model, tokenId, cache = null) {
   return await softcap(device, model, logits, 15.0);
 }
 
+// Float32Array-returning forward (test-friendly). Calls forwardT then
+// downloads + slices to vocab_size.
+export async function forward(device, model, tokenId, cache = null) {
+  const t = await forwardT(device, model, tokenId, cache);
+  const arr = await downloadTensor(device, t);
+  releaseTensor(model, t);
+  return arr.slice(0, model.config.vocab_size);
+}
+
+// ---------------------------------------------------------------------
+// Argmax (GPU-side). Returns a Tensor whose buffer holds one u32 — the
+// argmax index of `x`. The buffer is stored as 4 bytes; downloadU32
+// reads it back to JS as a single integer.
+// ---------------------------------------------------------------------
+export async function argmaxT(device, model, x) {
+  const pipeline = await getPipeline(device, model, "argmax");
+  const out = allocTensor(device, model, [1], "argmax_out");
+  const u = _writeUniforms(device, model, [x.byteLength / 4]);
+  _dispatch(device, pipeline, [x.buffer, out.buffer], u, [1]);
+  _ensurePool(model).release(u);
+  return out;
+}
+
+export async function downloadU32(device, t) {
+  const staging = device.createBuffer({
+    size: t.byteLength,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(t.buffer, 0, staging, 0, t.byteLength);
+  device.queue.submit([enc.finish()]);
+  await staging.mapAsync(GPUMapMode.READ);
+  const out = new Uint32Array(staging.getMappedRange().slice(0));
+  staging.unmap(); staging.destroy();
+  return out;
+}
+
+// In-GPU buffer copy helper. Used for snapshotting cache.prevEmbedding.
+function copyTensor(device, model, src) {
+  const dst = allocTensor(device, model, src.shape, (src.label || "tensor") + "_copy");
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(src.buffer, 0, dst.buffer, 0, src.byteLength);
+  device.queue.submit([enc.finish()]);
+  return dst;
+}
+
+// ---------------------------------------------------------------------
+// forwardT — fully on-GPU forward pass. Input: token id (JS int).
+// Output: logits Tensor of shape [vocab_size]. The cache (if provided)
+// is mutated in place. Only the token id crosses CPU/GPU at the entry;
+// only the caller's downloadTensor (or argmaxT + downloadU32) crosses
+// at the exit.
+// ---------------------------------------------------------------------
+export async function forwardT(device, model, tokenId, cache = null) {
+  const cfg = model.config;
+  const n_layer = cfg.n_layer;
+  const n_embd  = cfg.n_embd;
+  const T0 = cache ? cache.seqlens : 0;
+
+  // 1. Embedding + norm (post-norm, pre-smear)
+  let x = await embeddingT(device, model, "transformer.wte.weight", tokenId);
+  x.shape = [1, n_embd];   // reshape view; same buffer
+  const xNormed = await rmsnormT(device, model, x); releaseTensor(model, x);
+  x = xNormed;
+
+  // 1b. Smear (decode T=1) — same dance as old forward but on Tensors:
+  //    x_pre_smear = cache.prev;  cache.prev = x;  if x_pre_smear: x += gate * x_pre_smear
+  if (cache) {
+    const xPreSmear = cache.prevEmbeddingT;
+    cache.prevEmbeddingT = copyTensor(device, model, x);
+
+    if (xPreSmear !== null) {
+      if (model.smearLambda === undefined) {
+        model.smearLambda = (await downloadF32(device, model.tensors.get("smear_lambda").buffer, 4))[0];
+      }
+      const gateRaw    = await linearT  (device, model, x, "smear_gate.weight");          // (1, 1)
+      const gateSig    = await sigmoidT (device, model, gateRaw); releaseTensor(model, gateRaw);
+      const gateScaled = await scalarMulT(device, model, gateSig, model.smearLambda); releaseTensor(model, gateSig);
+      // gateScaled is shape (1,1) (one float). Need to broadcast across n_embd.
+      // Cheapest hack: download the one float, fill a Tensor.
+      const g = (await downloadTensor(device, gateScaled))[0];
+      releaseTensor(model, gateScaled);
+      const broadcast = uploadTensor(device, model, new Float32Array(n_embd).fill(g), [1, n_embd], "smear_bcast");
+      const smeared = await mulT(device, model, broadcast, xPreSmear); releaseTensor(model, broadcast);
+      const newX = await addT(device, model, x, smeared); releaseTensor(model, smeared);
+      releaseTensor(model, x); x = newX;
+      releaseTensor(model, xPreSmear);
+    }
+  }
+
+  // x0 baseline = post-smear normalized embedding (snapshot)
+  const x0 = copyTensor(device, model, x);
+
+  // 2. Transformer blocks
+  const backoutIdx = Math.floor(n_layer / 2);
+  let xBackout = null;
+  for (let i = 0; i < n_layer; i++) {
+    let ve = null;
+    const veName = `value_embeds.${i}.weight`;
+    if (model.tensors.has(veName)) {
+      ve = await embeddingT(device, model, veName, tokenId);
+      ve.shape = [1, ve.byteLength / 4];
+    }
+    const next = await transformerBlockT(device, model, i, x, x0, T0, ve, cache);
+    if (ve) releaseTensor(model, ve);
+    releaseTensor(model, x);
+    x = next;
+    if (i === backoutIdx) xBackout = copyTensor(device, model, x);
+  }
+  releaseTensor(model, x0);
+
+  if (cache) cache.seqlens += 1;
+
+  // 3. Backout subtract: x = x - backout_lambda * x_backout
+  if (xBackout !== null) {
+    if (model.backoutLambda === undefined) {
+      model.backoutLambda = (await downloadF32(device, model.tensors.get("backout_lambda").buffer, 4))[0];
+    }
+    const negScaled = await scalarMulT(device, model, xBackout, -model.backoutLambda);
+    releaseTensor(model, xBackout);
+    const newX = await addT(device, model, x, negScaled); releaseTensor(model, negScaled);
+    releaseTensor(model, x); x = newX;
+  }
+
+  // 4. Final norm + lm_head + softcap
+  const xN = await rmsnormT(device, model, x); releaseTensor(model, x);
+  const logitsPadded = await linearT(device, model, xN, "lm_head.weight"); releaseTensor(model, xN);
+  const logitsCapped = await softcapT(device, model, logitsPadded, 15.0); releaseTensor(model, logitsPadded);
+  // Slice to true vocab if padded — leave as-is (caller can read first vocab_size)
+  return logitsCapped;
+}
+
 // ---------------------------------------------------------------------
 // Greedy generation: prefill prompt, then sample argmax `maxNew` times.
 // Returns full token sequence (prompt + generated). Temperature 0.
@@ -707,17 +843,31 @@ export async function greedyGenerate(device, model, promptTokens, maxNew, maxSeq
   const total = promptTokens.length + maxNew;
   const cache = initKVCache(device, model, maxSeqLen ?? total);
 
-  let lastLogits = null;
+  // Prefill: run forwardT for each prompt token. We only care about the
+  // last one's logits (used to sample token 0 of the generation).
+  let lastLogitsT = null;
   for (const tok of promptTokens) {
-    lastLogits = await forward(device, model, tok, cache);
+    if (lastLogitsT) releaseTensor(model, lastLogitsT);
+    lastLogitsT = await forwardT(device, model, tok, cache);
   }
 
+  // Generate: argmaxT each step on GPU; only the chosen token id (1 int)
+  // ever crosses CPU/GPU. forwardT is the only thing that handles the
+  // 32K-vocab logits array — it never leaves the GPU.
   const out = promptTokens.slice();
   for (let i = 0; i < maxNew; i++) {
-    const next = _argmax(lastLogits);
+    const argT = await argmaxT(device, model, lastLogitsT);
+    const next = (await downloadU32(device, argT))[0];
+    releaseTensor(model, argT);
+    releaseTensor(model, lastLogitsT);
     out.push(next);
-    if (i < maxNew - 1) lastLogits = await forward(device, model, next, cache);
+    if (i < maxNew - 1) {
+      lastLogitsT = await forwardT(device, model, next, cache);
+    } else {
+      lastLogitsT = null;
+    }
   }
+  if (lastLogitsT) releaseTensor(model, lastLogitsT);
 
   destroyKVCache(cache);
   return out;
