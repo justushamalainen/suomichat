@@ -64,7 +64,8 @@ export async function loadModel(device, config, manifest, weightsUrl) {
     const gpuBuf = device.createBuffer({
       label: name,
       size: sizeBytes,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      // COPY_SRC lets us read small scalar tensors back to CPU (resid_lambdas etc.)
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
     device.queue.writeBuffer(gpuBuf, 0, slice);
     tensors.set(name, { buffer: gpuBuf, shape: meta.shape, dtype: meta.dtype });
@@ -420,6 +421,45 @@ export async function ropeApply(device, model, x, N, D, T0 = 0) {
   const result = await downloadF32(device, yBuf, N * D * 4);
   xBuf.destroy(); yBuf.destroy(); uniforms.destroy();
   return result;
+}
+
+// ---------------------------------------------------------------------
+// Full transformer block (one layer). Mirrors the outer loop in
+// GPT.forward(), which does:
+//   x = resid_lambdas[i] * x + x0_lambdas[i] * x0
+//   x = x + block.attn(norm(x), ve, cos_sin, window, kv_cache)
+//   x = x + block.mlp(norm(x))
+// We cache the tiny per-layer scalar arrays on the model the first
+// time we need them.
+// ---------------------------------------------------------------------
+async function ensureScalars(device, model) {
+  if (model.residLambdas) return;
+  const n = model.config.n_layer;
+  model.residLambdas = await downloadF32(device, model.tensors.get("resid_lambdas").buffer, n * 4);
+  model.x0Lambdas    = await downloadF32(device, model.tensors.get("x0_lambdas").buffer,    n * 4);
+}
+
+export async function transformerBlock(device, model, layerIdx, x, x0, T0 = 0, ve = null) {
+  await ensureScalars(device, model);
+  const residL = model.residLambdas[layerIdx];
+  const x0L    = model.x0Lambdas[layerIdx];
+
+  // 1. Per-layer residual mix
+  const resid = await scalarMul(device, model, x, residL);
+  const x0m   = await scalarMul(device, model, x0, x0L);
+  let   cur   = await add(device, model, resid, x0m);
+
+  // 2. Attention + residual
+  const xn    = await rmsnorm(device, model, cur);
+  const ao    = await attentionBlock(device, model, layerIdx, xn, T0, ve);
+  cur         = await add(device, model, cur, ao);
+
+  // 3. MLP + residual
+  const xn2   = await rmsnorm(device, model, cur);
+  const mo    = await mlpBlock(device, model, layerIdx, xn2);
+  cur         = await add(device, model, cur, mo);
+
+  return cur;
 }
 
 // ---------------------------------------------------------------------

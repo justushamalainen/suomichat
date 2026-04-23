@@ -207,6 +207,55 @@ async def test_elementwise(seed: int = 0, n: int = 768):
     return all(results)
 
 
+async def test_transformer_block(model, layer_idx: int = 0, seed: int = 0, atol: float = 5e-4):
+    """Full block: resid_lambda mix + attn + mlp + residuals. Against model.transformer.h[i]."""
+    from suomichat.gpt import has_ve
+    print(f"--- test: transformer_block layer {layer_idx} ---")
+    g = torch.Generator().manual_seed(seed)
+    n_embd = model.config.n_embd
+    n_layer = model.config.n_layer
+
+    x = torch.randn(1, 1, n_embd, dtype=torch.float32, generator=g)
+    x0 = torch.randn(1, 1, n_embd, dtype=torch.float32, generator=g)
+
+    T0 = 0
+    cos = model.cos[:, T0:T0+1]
+    sin = model.sin[:, T0:T0+1]
+
+    # Compute the outer-forward mix manually (this is in GPT.forward, not Block.forward)
+    residL = model.resid_lambdas[layer_idx].item()
+    x0L    = model.x0_lambdas[layer_idx].item()
+    x_mixed = residL * x + x0L * x0
+
+    if has_ve(layer_idx, n_layer):
+        ve_tensor = model.value_embeds[str(layer_idx)](torch.tensor([[0]]))
+        ve_arg = ve_tensor.flatten().tolist()
+    else:
+        ve_tensor = None
+        ve_arg = None
+
+    with torch.no_grad():
+        ref = model.transformer.h[layer_idx](x_mixed, ve_tensor, (cos, sin), (-1, 0), None).cpu().float().numpy()
+
+    got = await run_browser_op("block", {
+        "x": x.flatten().tolist(),
+        "x0": x0.flatten().tolist(),
+        "layerIdx": layer_idx,
+        "T0": T0,
+        "ve": ve_arg,
+    })
+    got = torch.tensor(got, dtype=torch.float32).view(ref.shape).numpy()
+    diff = abs(ref - got).max()
+    print(f"  max abs diff: {diff:.3e}  (tol {atol:.0e})")
+    if diff <= atol:
+        print("  ✓ PASS")
+        return True
+    print(f"  ref[0, 0, :6]: {ref[0, 0, :6]}")
+    print(f"  got[0, 0, :6]: {got[0, 0, :6]}")
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_attention_block(model, layer_idx: int = 0, seed: int = 0, atol: float = 5e-4):
     """Verify attentionBlock against model.transformer.h[i].attn() for T=1."""
     from suomichat.gpt import has_ve
@@ -395,6 +444,8 @@ async def main():
     passed.append(await test_mlp_block(model, layer_idx=6))                     # mid-stack sanity
     passed.append(await test_attention_block(model, layer_idx=0))               # no value embeds
     passed.append(await test_attention_block(model, layer_idx=1))               # has value embeds
+    passed.append(await test_transformer_block(model, layer_idx=0))
+    passed.append(await test_transformer_block(model, layer_idx=1))
 
     # Future: test_full_forward, etc.
 

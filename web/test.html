@@ -16,7 +16,7 @@ which the Python driver invokes.</p>
 <script type="module">
 import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul, linear,
          add, mul, scalarMul, relu2, sigmoid, ropeApply, mlpBlock,
-         attentionBlock } from "./runtime.js";
+         attentionBlock, transformerBlock } from "./runtime.js";
 
 const status = document.getElementById("status");
 
@@ -86,6 +86,13 @@ const status = document.getElementById("status");
           const ve = args.ve ? new Float32Array(args.ve) : null;
           const r = await attentionBlock(device, model, args.layerIdx,
                                           new Float32Array(args.x), args.T0 ?? 0, ve);
+          return Array.from(r);
+        }
+        case "block": {
+          const ve = args.ve ? new Float32Array(args.ve) : null;
+          const r = await transformerBlock(device, model, args.layerIdx,
+                                            new Float32Array(args.x), new Float32Array(args.x0),
+                                            args.T0 ?? 0, ve);
           return Array.from(r);
         }
         default:
