@@ -60,6 +60,15 @@ def ref_relu2(a):          return torch.nn.functional.relu(a).square()
 def ref_sigmoid(a):        return torch.sigmoid(a)
 
 
+def ref_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """PyTorch reference matching suomichat.gpt.apply_rotary_emb exactly."""
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], dim=-1)
+
+
 # ----------------------------------------------------------------------
 # Headless Chrome driver
 # ----------------------------------------------------------------------
@@ -193,6 +202,40 @@ async def test_elementwise(seed: int = 0, n: int = 768):
     return all(results)
 
 
+async def test_rope(model, seed: int = 0, T0: int = 0, atol: float = 1e-5):
+    print(f"--- test: rope (T0={T0}) ---")
+    g = torch.Generator().manual_seed(seed)
+    # d12 config: n_head=6, head_dim = n_embd/n_head = 768/6 = 128
+    head_dim = model.config.n_embd // model.config.n_head
+    n_heads = model.config.n_head
+
+    # Shape matches attention code: (B=1, T=1, H=nHeads, D=head_dim)
+    x = torch.randn(1, 1, n_heads, head_dim, dtype=torch.float32, generator=g)
+    cos = model.cos[:, T0:T0+1]   # (1, 1, 1, d)
+    sin = model.sin[:, T0:T0+1]
+    ref = ref_rope(x, cos, sin).detach().cpu().float().numpy().flatten()
+
+    # Browser: pass flat (N=H, D=head_dim)
+    got = await run_browser_op("rope", {
+        "x": x.flatten().tolist(),
+        "N": n_heads, "D": head_dim, "T0": T0,
+    })
+    got = torch.tensor(got, dtype=torch.float32).numpy()
+
+    if got.shape != ref.shape:
+        print(f"  SHAPE MISMATCH: ref={ref.shape}, got={got.shape}")
+        return False
+    diff = abs(ref - got).max()
+    print(f"  max abs diff: {diff:.3e}  (tol {atol:.0e})")
+    print(f"  ref[:6]: {ref[:6]}")
+    print(f"  got[:6]: {got[:6]}")
+    if diff <= atol:
+        print("  ✓ PASS")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_rmsnorm(seed: int = 0, n: int = 768, atol: float = 1e-5):
     print(f"--- test: rmsnorm (n={n}, seed={seed}) ---")
     g = torch.Generator().manual_seed(seed)
@@ -240,8 +283,10 @@ async def main():
     passed.append(await test_matmul(seed=1, M=768, K=768, N=2048))    # shape: MLP c_fc
     passed.append(await test_matmul(seed=2, M=2, K=3, N=4))           # tiny sanity check
     passed.append(await test_elementwise(seed=0, n=768))              # add/mul/scalar_mul/relu2/sigmoid
+    passed.append(await test_rope(model, seed=0, T0=0))
+    passed.append(await test_rope(model, seed=1, T0=17))              # non-zero offset
 
-    # Future: test_rope, test_attention, test_full_forward, etc.
+    # Future: test_attention, test_full_forward, etc.
 
     n_pass = sum(passed)
     n_total = len(passed)

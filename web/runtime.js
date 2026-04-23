@@ -323,6 +323,58 @@ async function _elemUnary(device, model, name, a, extraFloat = null) {
   return result;
 }
 
+// ---------------------------------------------------------------------
+// RoPE: rotate the last dim of x using model.cos / model.sin at time T0.
+// x has shape (N, D) where D = head_dim; cos/sin have shape
+// (rotary_seq_len, d) with d = D/2 (these buffers already live on the GPU
+// from loadModel).
+// ---------------------------------------------------------------------
+export async function ropeApply(device, model, x, N, D, T0 = 0) {
+  if (D % 2 !== 0) throw new Error("RoPE: head_dim must be even");
+  const d = D / 2;
+  const pipeline = await getPipeline(device, model, "rope");
+  const cos = model.tensors.get("cos");
+  const sin = model.tensors.get("sin");
+  if (!cos || !sin) throw new Error("RoPE: cos/sin buffers missing from manifest");
+
+  const xBuf = uploadF32(device, "rope_x", x);
+  const yBuf = device.createBuffer({
+    label: "rope_y", size: N * D * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  const ub = new ArrayBuffer(16);
+  const u32 = new Uint32Array(ub);
+  u32[0] = N; u32[1] = D; u32[2] = d; u32[3] = T0;
+  const uniforms = device.createBuffer({
+    size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(uniforms, 0, ub);
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: xBuf } },
+      { binding: 1, resource: { buffer: cos.buffer } },
+      { binding: 2, resource: { buffer: sin.buffer } },
+      { binding: 3, resource: { buffer: yBuf } },
+      { binding: 4, resource: { buffer: uniforms } },
+    ],
+  });
+
+  const total = N * D;
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(total / 64));
+  pass.end();
+  device.queue.submit([enc.finish()]);
+
+  const result = await downloadF32(device, yBuf, N * D * 4);
+  xBuf.destroy(); yBuf.destroy(); uniforms.destroy();
+  return result;
+}
+
 export const add         = (device, model, a, b)        => _elemBinary(device, model, "add", a, b);
 export const mul         = (device, model, a, b)        => _elemBinary(device, model, "mul", a, b);
 export const scalarMul   = (device, model, a, alpha)    => _elemUnary (device, model, "scalar_mul", a, alpha);

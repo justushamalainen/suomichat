@@ -15,7 +15,7 @@ which the Python driver invokes.</p>
 
 <script type="module">
 import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul,
-         add, mul, scalarMul, relu2, sigmoid } from "./runtime.js";
+         add, mul, scalarMul, relu2, sigmoid, ropeApply } from "./runtime.js";
 
 const status = document.getElementById("status");
 
@@ -67,6 +67,10 @@ const status = document.getElementById("status");
         }
         case "sigmoid": {
           const r = await sigmoid(device, model, new Float32Array(args.a));
+          return Array.from(r);
+        }
+        case "rope": {
+          const r = await ropeApply(device, model, new Float32Array(args.x), args.N, args.D, args.T0);
           return Array.from(r);
         }
         default:
