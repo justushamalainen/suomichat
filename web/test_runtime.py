@@ -668,7 +668,7 @@ async def test_rmsnorm(seed: int = 0, n: int = 768, atol: float = 1e-5):
 # ----------------------------------------------------------------------
 async def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-tag", default="d12")
+    ap.add_argument("--model-tag", default="d6")
     ap.add_argument("--source", default="sft")
     ap.add_argument("--token-id", type=int, default=100)
     ap.add_argument("--base-url", default="http://localhost:9876")
@@ -692,7 +692,7 @@ async def main():
     passed.append(await test_linear(model, "transformer.h.0.attn.c_q.weight"))  # (768, 768)
     passed.append(await test_linear(model, "transformer.h.0.mlp.c_fc.weight"))  # (3072, 768) d12: 4*n_embd
     passed.append(await test_mlp_block(model, layer_idx=0))
-    passed.append(await test_mlp_block(model, layer_idx=6))                     # mid-stack sanity
+    passed.append(await test_mlp_block(model, layer_idx=model.config.n_layer - 1))   # last layer sanity
     passed.append(await test_attention_block(model, layer_idx=0))               # no value embeds
     passed.append(await test_attention_block(model, layer_idx=1))               # has value embeds
     passed.append(await test_transformer_block(model, layer_idx=0))

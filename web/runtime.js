@@ -93,7 +93,112 @@ async function getPipeline(device, model, name) {
 }
 
 // ---------------------------------------------------------------------
-// 4. Helper: turn a Float32Array into a STORAGE GPUBuffer.
+// 4. Tensor abstraction.
+// ---------------------------------------------------------------------
+//
+// A `Tensor` is just `{buffer, shape, byteLength, label}` — a GPUBuffer
+// plus its declared shape. All on-GPU ops in the new fast path take
+// Tensors in and return Tensors out, never touching CPU until the very
+// end of the forward pass.
+//
+// We keep the `Float32Array → primitive → Float32Array` test-friendly
+// API as thin wrappers (uploadTensor + op_t + downloadTensor) so the
+// existing test suite still works while the refactor lands piece by
+// piece.
+//
+// Buffer pool (`BufferPool`) recycles GPUBuffers by (size, usage) to
+// avoid the per-call createBuffer/destroy that dominates today's
+// runtime. Caller responsibilities:
+//   - allocTensor       → pool.acquire under the hood
+//   - releaseTensor     → returns its buffer to the pool
+// Pool buffers are zero-initialised by writeBuffer/dispatch on the
+// first use; we never read from them before writing, so leftover bytes
+// from a previous use are harmless.
+// ---------------------------------------------------------------------
+const TENSOR_USAGE = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+
+export class BufferPool {
+  constructor() {
+    this.free = new Map();   // key -> [GPUBuffer, ...]
+    this.outstanding = 0;
+  }
+  _key(size, usage) { return `${size}/${usage}`; }
+  acquire(device, size, usage = TENSOR_USAGE, label = "pool") {
+    const k = this._key(size, usage);
+    const list = this.free.get(k);
+    if (list && list.length) {
+      this.outstanding++;
+      return list.pop();
+    }
+    this.outstanding++;
+    return device.createBuffer({ label, size, usage });
+  }
+  release(buf) {
+    if (!buf) return;
+    const k = this._key(buf.size, buf.usage);
+    let list = this.free.get(k);
+    if (!list) { list = []; this.free.set(k, list); }
+    list.push(buf);
+    this.outstanding--;
+  }
+  destroy() {
+    for (const list of this.free.values()) for (const b of list) b.destroy();
+    this.free.clear();
+  }
+}
+
+function _ensurePool(model) {
+  if (!model.pool) model.pool = new BufferPool();
+  return model.pool;
+}
+
+// Allocate a Tensor of `shape` (number[]). Uses the model's pool.
+export function allocTensor(device, model, shape, label = "tensor", usage = TENSOR_USAGE) {
+  const numel = shape.reduce((a, b) => a * b, 1);
+  const byteLength = numel * 4;
+  const buffer = _ensurePool(model).acquire(device, byteLength, usage, label);
+  return { buffer, shape, byteLength, label, _pooled: true };
+}
+
+// Wrap an existing GPUBuffer (e.g. weight tensor from loadModel) as a Tensor
+// without going through the pool. Caller owns lifecycle.
+export function wrapTensor(buffer, shape, label = "wrapped") {
+  return { buffer, shape, byteLength: shape.reduce((a, b) => a * b, 1) * 4, label, _pooled: false };
+}
+
+// Upload a Float32Array as a new Tensor. Goes through the pool.
+export function uploadTensor(device, model, arr, shape = null, label = "uploaded") {
+  if (shape === null) shape = [arr.length];
+  const t = allocTensor(device, model, shape, label);
+  device.queue.writeBuffer(t.buffer, 0, arr);
+  return t;
+}
+
+// Read a Tensor back to CPU as a Float32Array. Synchronous-style (await).
+// Does NOT release the source tensor — caller decides.
+export async function downloadTensor(device, t) {
+  const staging = device.createBuffer({
+    size: t.byteLength,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(t.buffer, 0, staging, 0, t.byteLength);
+  device.queue.submit([enc.finish()]);
+  await staging.mapAsync(GPUMapMode.READ);
+  const out = new Float32Array(staging.getMappedRange().slice(0));
+  staging.unmap(); staging.destroy();
+  return out;
+}
+
+// Return a tensor's buffer to the pool. After this the tensor must not
+// be used again. Safe on non-pooled tensors (no-op).
+export function releaseTensor(model, t) {
+  if (t && t._pooled) _ensurePool(model).release(t.buffer);
+}
+
+// ---------------------------------------------------------------------
+// 4b. Legacy: turn a Float32Array into a one-shot STORAGE GPUBuffer.
+// Kept for the existing primitives until they migrate to Tensor in/out.
 // ---------------------------------------------------------------------
 function uploadF32(device, label, arr) {
   const buf = device.createBuffer({
