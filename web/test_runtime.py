@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import json
 import sys
+import os
 from pathlib import Path
 
 import torch
@@ -666,18 +667,47 @@ async def test_rmsnorm(seed: int = 0, n: int = 768, atol: float = 1e-5):
 
 
 # ----------------------------------------------------------------------
+BASELINE_MS_PER_TOKEN = 140.0   # forwardT pre-batching, RTX 6000 Ada, d6 SFT
+BASELINE_LEGACY_MS    = 180.0   # _forward_legacy reference
+
+async def run_bench(N: int, token_id: int):
+    new_b = await run_browser_op("bench_forward", {"tokenId": token_id, "N": N, "legacy": False})
+    old_b = await run_browser_op("bench_forward", {"tokenId": token_id, "N": N, "legacy": True})
+    summary = {
+        "N": N,
+        "token_id": token_id,
+        "forwardT_ms_per_token": round(new_b["msPerToken"], 2),
+        "legacy_ms_per_token":   round(old_b["msPerToken"], 2),
+        "baseline_ms_per_token": BASELINE_MS_PER_TOKEN,
+        "speedup_vs_legacy":     round(old_b["ms"] / new_b["ms"], 2),
+        "speedup_vs_baseline":   round(BASELINE_MS_PER_TOKEN / new_b["msPerToken"], 2),
+    }
+    return summary
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-tag", default="d6")
     ap.add_argument("--source", default="sft")
     ap.add_argument("--token-id", type=int, default=100)
     ap.add_argument("--base-url", default="http://localhost:9876")
+    ap.add_argument("--bench-only", action="store_true",
+                    help="Skip correctness tests; just run the bench and print JSON.")
+    ap.add_argument("--bench-n", type=int, default=50,
+                    help="Iterations per bench run (default 50).")
     args = ap.parse_args()
 
     print(f"Loading {args.source} model {args.model_tag} for reference computation...")
     model, tokenizer, meta = load_model(
         args.source, device=torch.device("cpu"), phase="eval", model_tag=args.model_tag,
     )
+
+    if args.bench_only:
+        # Need a model load to populate the page first — call any cheap op.
+        await test_embedding(model, args.token_id)
+        summary = await run_bench(args.bench_n, args.token_id)
+        print(json.dumps(summary, indent=2))
+        sys.exit(0)
 
     passed = []
     passed.append(await test_embedding(model, args.token_id))
@@ -711,16 +741,10 @@ async def main():
     passed.append(await test_tokenizer_render("Moi! Kuka olet?"))
     passed.append(await test_chat_e2e(model, "Moi! Kuka olet?", max_new=8))
 
-    # Bench the new GPU-only forward path vs the legacy Float32Array path.
-    # Not assertive — just prints timings.
-    print("--- bench: forwardT (GPU-only path) ---")
-    new_b = await run_browser_op("bench_forward", {"tokenId": 100, "N": 30, "legacy": False})
-    print(f"  N={new_b['N']} total={new_b['ms']:.0f} ms  =>  {new_b['msPerToken']:.1f} ms/token")
-    print("--- bench: _forward_legacy (Float32Array round-trips) ---")
-    old_b = await run_browser_op("bench_forward", {"tokenId": 100, "N": 30, "legacy": True})
-    print(f"  N={old_b['N']} total={old_b['ms']:.0f} ms  =>  {old_b['msPerToken']:.1f} ms/token")
-    speedup = old_b['ms'] / new_b['ms']
-    print(f"  speedup: {speedup:.1f}x")
+    # Bench. Structured summary so the autonomous loop can detect regressions.
+    print("--- bench ---")
+    summary = await run_bench(args.bench_n, 100)
+    print(json.dumps(summary, indent=2))
 
     n_pass = sum(passed)
     n_total = len(passed)
