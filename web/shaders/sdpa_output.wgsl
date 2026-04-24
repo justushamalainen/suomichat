@@ -1,12 +1,13 @@
-// Attention weighted sum (T_q=1): out[h, d] = sum_tk attn[h, tk] * V_cache[tk, h_kv, d]
+// Attention weighted-value sum, T queries × Tk keys.
 //
-// attn:     (nH * Tk)           softmaxed attention weights
-// v_cache:  (max_T * nKV * hd)  GPU-resident V cache, layout (t, h_kv, d)
-// out:      (nH * hd)
+// out[t, h, d] = sum_tk attn[t, h, tk] * V_cache[tk, h_kv, d]
 //
-// GQA mapping: h_kv = h * nKV / nH.
+// attn:     (T * nH * Tk)        post-softmax weights (causal-masked
+//                                positions are exactly 0)
+// v_cache:  (max_T * nKV * hd)
+// out:      (T * nH * hd)
 //
-// Dispatch: (ceil(nH/8), ceil(hd/8)). One thread per (h, d).
+// Dispatch: ceil(T*nH / 8) × ceil(hd / 8). One thread per (t, h, d).
 
 @group(0) @binding(0) var<storage, read>       attn:     array<f32>;
 @group(0) @binding(1) var<storage, read>       v_cache:  array<f32>;
@@ -18,23 +19,29 @@ struct Params {
     nKV: u32,
     hd:  u32,
     Tk:  u32,
+    T:   u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
 };
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let h = gid.x;
-    let d = gid.y;
-    if (h >= params.nH || d >= params.hd) { return; }
+    let qIdx = gid.x;
+    let d    = gid.y;
+    if (qIdx >= params.T * params.nH || d >= params.hd) { return; }
 
+    let t    = qIdx / params.nH;
+    let h    = qIdx % params.nH;
     let h_kv = (h * params.nKV) / params.nH;
 
-    var s: f32 = 0.0;
+    var sum: f32 = 0.0;
     var tk: u32 = 0u;
     loop {
         if (tk >= params.Tk) { break; }
-        let v_off = tk * params.nKV * params.hd + h_kv * params.hd + d;
-        s = s + attn[h * params.Tk + tk] * v_cache[v_off];
+        let v_off = (tk * params.nKV + h_kv) * params.hd + d;
+        sum = sum + attn[(t * params.nH + h) * params.Tk + tk] * v_cache[v_off];
         tk = tk + 1u;
     }
-    out[h * params.hd + d] = s;
+    out[(t * params.nH + h) * params.hd + d] = sum;
 }

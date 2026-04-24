@@ -1180,29 +1180,31 @@ export async function attentionBlockT(device, model, layerIdx, x, T0 = 0, ve = n
     _copyBuffer(device, model, v.buffer,  0, cache.vBuffers[layerIdx], writeOffset, kvDim * 4);
     const Tk = cache.seqlens + 1;
 
-    // sdpa_scores: (n_head, Tk)
-    const scoresT = allocTensor(device, model, [n_head, Tk], "sdpa_scores");
+    // T=1 decode: T0 = cache.seqlens (= the query's absolute position),
+    //             Tk = T0 + 1, T = 1. All Tk slots are valid (no causal
+    //             mask kicks in because tk <= T0+0 = T0 = Tk-1 always).
+    const T = 1;
+    const T0 = cache.seqlens;
+    const scoresT = allocTensor(device, model, [T, n_head, Tk], "sdpa_scores");
     {
       const pipeline = await getPipeline(device, model, "sdpa_scores");
       const u = _writeUniforms(device, model,
-        [n_head, n_kv, head_dim, Tk],
-        [[16, 1.0 / Math.sqrt(head_dim)]]);
+        [n_head, n_kv, head_dim, Tk, T, T0],
+        [[24, 1.0 / Math.sqrt(head_dim)]]);
       _dispatch(device, model, pipeline,
         [qS.buffer, cache.kBuffers[layerIdx], scoresT.buffer],
-        u, [Math.ceil(n_head / 8), Math.ceil(Tk / 8)]);
+        u, [Math.ceil(T * n_head / 8), Math.ceil(Tk / 8)]);
       _releaseUniform(model, u);
     }
-    // softmax rows
-    const attnW = await softmaxT(device, model, scoresT, n_head, Tk);
+    const attnW = await softmaxT(device, model, scoresT, T * n_head, Tk);
     releaseTensor(model, scoresT);
-    // sdpa_output: (n_head, head_dim)
-    attnT = allocTensor(device, model, [1, n_head * head_dim], "sdpa_out");
+    attnT = allocTensor(device, model, [T, n_head * head_dim], "sdpa_out");
     {
       const pipeline = await getPipeline(device, model, "sdpa_output");
-      const u = _writeUniforms(device, model, [n_head, n_kv, head_dim, Tk]);
+      const u = _writeUniforms(device, model, [n_head, n_kv, head_dim, Tk, T]);
       _dispatch(device, model, pipeline,
         [attnW.buffer, cache.vBuffers[layerIdx], attnT.buffer],
-        u, [Math.ceil(n_head / 8), Math.ceil(head_dim / 8)]);
+        u, [Math.ceil(T * n_head / 8), Math.ceil(head_dim / 8)]);
       _releaseUniform(model, u);
     }
     releaseTensor(model, attnW);

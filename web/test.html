@@ -18,7 +18,9 @@ import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul, linear,
          add, mul, scalarMul, relu2, sigmoid, ropeApply, mlpBlock,
          attentionBlock, transformerBlock, forward, softmax,
          initKVCache, destroyKVCache, greedyGenerate,
-         forwardT, releaseTensor, _forward_legacy } from "./runtime.js";
+         forwardT, releaseTensor, _forward_legacy,
+         allocTensor, uploadTensor, downloadTensor,
+         softmaxT, beginSession } from "./runtime.js";
 import { loadTokenizer, decodeTokens, encodeOrdinary, renderForCompletion } from "./tokenizer.js";
 
 const status = document.getElementById("status");
@@ -72,6 +74,113 @@ const status = document.getElementById("status");
         case "sigmoid": {
           const r = await sigmoid(device, model, new Float32Array(args.a));
           return Array.from(r);
+        }
+        case "sdpa_t": {
+          // Direct exercise of T>1 SDPA pipeline. Writes K, V into a tiny
+          // cache buffer (just T positions, no T0 offset) then runs the
+          // sdpa_scores → softmax → sdpa_output chain.
+          const { T, nH, nKV, hd } = args;
+          const Tk = T;
+          // Build buffers
+          const qT = uploadTensor(device, model, new Float32Array(args.q), [T, nH, hd], "sdpa_q");
+          const kBuf = device.createBuffer({ size: Tk * nKV * hd * 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+          const vBuf = device.createBuffer({ size: Tk * nKV * hd * 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+          device.queue.writeBuffer(kBuf, 0, new Float32Array(args.k));
+          device.queue.writeBuffer(vBuf, 0, new Float32Array(args.v));
+          // Build a fake "tensor" wrapper for the cache buffers
+          const kTensor = { buffer: kBuf, byteLength: Tk*nKV*hd*4, _pooled: false };
+          const vTensor = { buffer: vBuf, byteLength: Tk*nKV*hd*4, _pooled: false };
+
+          // Helper to run a single dispatch via the runtime's primitives —
+          // but the SDPA shaders aren't exported. Reach in via the lower
+          // level: get the pipelines and dispatch ourselves.
+          const scoresPipe = await (async () => {
+            const r = await fetch("./shaders/sdpa_scores.wgsl");
+            return device.createComputePipeline({
+              layout: "auto",
+              compute: { module: device.createShaderModule({ code: await r.text() }), entryPoint: "main" }
+            });
+          })();
+          const outputPipe = await (async () => {
+            const r = await fetch("./shaders/sdpa_output.wgsl");
+            return device.createComputePipeline({
+              layout: "auto",
+              compute: { module: device.createShaderModule({ code: await r.text() }), entryPoint: "main" }
+            });
+          })();
+          const softmaxPipe = await (async () => {
+            const r = await fetch("./shaders/softmax.wgsl");
+            return device.createComputePipeline({
+              layout: "auto",
+              compute: { module: device.createShaderModule({ code: await r.text() }), entryPoint: "main" }
+            });
+          })();
+
+          // scores buffer
+          const scoresBuf = device.createBuffer({ size: T*nH*Tk*4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+          // output buffer
+          const outBuf = device.createBuffer({ size: T*nH*hd*4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+
+          // sdpa_scores uniforms: nH, nKV, hd, Tk, T, T0=0, scale@24
+          const ub1 = new ArrayBuffer(32);
+          new Uint32Array(ub1).set([nH, nKV, hd, Tk, T, 0]);
+          new DataView(ub1).setFloat32(24, 1.0/Math.sqrt(hd), true);
+          const u1 = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+          device.queue.writeBuffer(u1, 0, ub1);
+
+          let enc = device.createCommandEncoder();
+          let pass = enc.beginComputePass();
+          pass.setPipeline(scoresPipe);
+          pass.setBindGroup(0, device.createBindGroup({
+            layout: scoresPipe.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: { buffer: qT.buffer } },
+              { binding: 1, resource: { buffer: kBuf } },
+              { binding: 2, resource: { buffer: scoresBuf } },
+              { binding: 3, resource: { buffer: u1 } },
+            ],
+          }));
+          pass.dispatchWorkgroups(Math.ceil(T*nH/8), Math.ceil(Tk/8));
+          pass.end();
+          device.queue.submit([enc.finish()]);
+
+          // softmax: rows = T*nH, n = Tk
+          const scoresTensor = { buffer: scoresBuf, byteLength: T*nH*Tk*4, _pooled: false, shape: [T*nH, Tk] };
+          const attnT = await softmaxT(device, model, scoresTensor, T*nH, Tk);
+
+          // sdpa_output uniforms: nH, nKV, hd, Tk, T
+          const ub2 = new ArrayBuffer(32);
+          new Uint32Array(ub2).set([nH, nKV, hd, Tk, T]);
+          const u2 = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+          device.queue.writeBuffer(u2, 0, ub2);
+
+          enc = device.createCommandEncoder();
+          pass = enc.beginComputePass();
+          pass.setPipeline(outputPipe);
+          pass.setBindGroup(0, device.createBindGroup({
+            layout: outputPipe.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: { buffer: attnT.buffer } },
+              { binding: 1, resource: { buffer: vBuf } },
+              { binding: 2, resource: { buffer: outBuf } },
+              { binding: 3, resource: { buffer: u2 } },
+            ],
+          }));
+          pass.dispatchWorkgroups(Math.ceil(T*nH/8), Math.ceil(hd/8));
+          pass.end();
+          device.queue.submit([enc.finish()]);
+
+          // Download
+          const outTensor = { buffer: outBuf, byteLength: T*nH*hd*4, _pooled: false };
+          const out = await downloadTensor(device, outTensor);
+          // Cleanup
+          kBuf.destroy(); vBuf.destroy(); scoresBuf.destroy(); outBuf.destroy(); u1.destroy(); u2.destroy();
+          releaseTensor(model, qT); releaseTensor(model, attnT);
+          return Array.from(out);
         }
         case "rope": {
           const r = await ropeApply(device, model, new Float32Array(args.x), args.N, args.D, args.T0, args.H);

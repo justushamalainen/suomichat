@@ -607,6 +607,47 @@ async def test_linear(model, weight_name: str, seed: int = 0, atol: float = 5e-4
     return False
 
 
+async def test_sdpa_t(model, T: int = 4, seed: int = 0, atol: float = 5e-4):
+    """T>1 SDPA with causal mask. Compare to PyTorch
+    F.scaled_dot_product_attention with is_causal=True."""
+    print(f"--- test: sdpa_t (T={T}) ---")
+    import numpy as np
+    g = torch.Generator().manual_seed(seed)
+    head_dim = model.config.n_embd // model.config.n_head
+    nH       = model.config.n_head
+    nKV      = model.config.n_kv_head
+    # Random Q (T, nH, hd), K/V (T, nKV, hd)
+    q = torch.randn(T, nH,  head_dim, dtype=torch.float32, generator=g)
+    k = torch.randn(T, nKV, head_dim, dtype=torch.float32, generator=g)
+    v = torch.randn(T, nKV, head_dim, dtype=torch.float32, generator=g)
+    # PyTorch reference: causal attention. SDPA expects (B, H, T, hd).
+    # Need to expand K, V to nH heads if GQA (here nH==nKV for d6 so identity).
+    q_t = q.transpose(0, 1).unsqueeze(0)         # (1, nH, T, hd)
+    k_t = k.transpose(0, 1).unsqueeze(0)         # (1, nKV, T, hd)
+    v_t = v.transpose(0, 1).unsqueeze(0)
+    # Repeat K, V if GQA
+    if nKV != nH:
+        k_t = k_t.repeat_interleave(nH // nKV, dim=1)
+        v_t = v_t.repeat_interleave(nH // nKV, dim=1)
+    ref = torch.nn.functional.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=True)
+    ref = ref.squeeze(0).transpose(0, 1).flatten().numpy()   # (T, nH, hd) flat
+
+    got = await run_browser_op("sdpa_t", {
+        "T": T, "nH": nH, "nKV": nKV, "hd": head_dim,
+        "q": q.flatten().tolist(),
+        "k": k.flatten().tolist(),
+        "v": v.flatten().tolist(),
+    })
+    got = np.array(got, dtype=np.float32)
+    diff = float(np.abs(ref - got).max())
+    print(f"  max abs diff: {diff:.3e} (tol {atol:.0e})")
+    if diff <= atol:
+        print("  ✓ PASS")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_rope_multi(model, T: int = 4, T0: int = 5, seed: int = 0, atol: float = 1e-5):
     """Multi-position RoPE: T tokens, n_head heads each, positions T0..T0+T-1."""
     print(f"--- test: rope_multi (T={T}, T0={T0}) ---")
@@ -752,6 +793,8 @@ async def main():
     passed.append(await test_rope(model, seed=0, T0=0))
     passed.append(await test_rope(model, seed=1, T0=17))              # non-zero offset
     passed.append(await test_rope_multi(model, T=4, T0=5))           # T>1 prefill
+    passed.append(await test_sdpa_t(model, T=4))                     # T>1 SDPA causal mask
+    passed.append(await test_sdpa_t(model, T=8))
     passed.append(await test_linear(model, "transformer.h.0.attn.c_q.weight"))  # (768, 768)
     passed.append(await test_linear(model, "transformer.h.0.mlp.c_fc.weight"))  # (3072, 768) d12: 4*n_embd
     passed.append(await test_mlp_block(model, layer_idx=0))
