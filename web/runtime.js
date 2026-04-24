@@ -304,6 +304,98 @@ function _ensureRingBG(device, model) {
 }
 
 // ---------------------------------------------------------------------
+// 4d-quater. Ring-aware pipeline + dispatch.
+//
+// `getRingPipeline`: creates a compute pipeline with explicit
+// PipelineLayout. Group 0 = storage entries (per-shader); Group 1 =
+// the shared uniform-with-dynamic-offset binding. Cached on the model
+// under the name + ":ring".
+//
+// `_dispatchRing`: equivalent of `_dispatch` for ring shaders.
+//   - storage bind group is built from `bufferBindings` (cached via
+//     the existing _getBindGroup helper, keyed by storage buffer ids)
+//   - sets group 1 to the shared ring bind group with the per-call
+//     dynamic offset that points at the slot allocated by _writeUniforms.
+// ---------------------------------------------------------------------
+async function getRingPipeline(device, model, name, storageEntries) {
+  const cacheKey = name + ":ring";
+  if (model.shaders.has(cacheKey)) return model.shaders.get(cacheKey);
+  const wgsl   = await (await fetch(`./shaders/${name}.wgsl`)).text();
+  const module = device.createShaderModule({ label: name, code: wgsl });
+  const bgl0 = device.createBindGroupLayout({
+    label: name + "_bgl0",
+    entries: storageEntries.map(e => ({
+      binding: e.binding,
+      visibility: GPUShaderStage.COMPUTE,
+      buffer: { type: e.type },     // "read-only-storage" or "storage"
+    })),
+  });
+  const bgl1 = _ensureRingBGL(device, model);
+  const pipelineLayout = device.createPipelineLayout({
+    label: name + "_pl",
+    bindGroupLayouts: [bgl0, bgl1],
+  });
+  const pipeline = device.createComputePipeline({
+    label: name,
+    layout: pipelineLayout,
+    compute: { module, entryPoint: "main" },
+  });
+  model.shaders.set(cacheKey, pipeline);
+  return pipeline;
+}
+
+// Cached storage bind group for ring shaders, keyed by the buffers'
+// stable ids (same scheme as the existing _getBindGroup).
+function _getStorageBG(device, model, pipeline, bufferBindings) {
+  if (!model.bindGroupCache) model.bindGroupCache = new Map();
+  const key = "ringBG/" + (pipeline.label || "?") + "/" + bufferBindings.map(_bufferId).join(",");
+  let bg = model.bindGroupCache.get(key);
+  if (bg) return bg;
+  const entries = bufferBindings.map((b, i) => ({ binding: i, resource: { buffer: b } }));
+  bg = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
+  model.bindGroupCache.set(key, bg);
+  return bg;
+}
+
+function _dispatchRing(device, model, pipeline, bufferBindings, dynamicOffset, dim) {
+  const bg0 = _getStorageBG(device, model, pipeline, bufferBindings);
+  const bg1 = _ensureRingBG(device, model);
+  if (model.activeSession) {
+    // Session.submit() calls ring.flush() before queue.submit, so writes
+    // are visible to the encoded dispatches.
+    const pass = model.activeSession._ensurePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bg0);
+    pass.setBindGroup(1, bg1, [dynamicOffset]);
+    pass.dispatchWorkgroups(dim[0], dim[1] ?? 1, dim[2] ?? 1);
+    return;
+  }
+  // Standalone path: flush staged uniforms NOW (they have to land on the
+  // GPU before the dispatch reads them), then submit and reset.
+  const ring = _ensureRing(device, model);
+  ring.flush();
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bg0);
+  pass.setBindGroup(1, bg1, [dynamicOffset]);
+  pass.dispatchWorkgroups(dim[0], dim[1] ?? 1, dim[2] ?? 1);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  ring.reset();
+}
+
+// Stage uniform values into the ring; returns the dynamic offset to
+// pass to setBindGroup. Replaces the per-dispatch _writeUniforms +
+// _releaseUniform pair for ring-aware shaders.
+function _stageUniforms(device, model, u32s, f32Pairs = []) {
+  const ring = _ensureRing(device, model);
+  const offset = ring.acquireSlot();
+  ring.writeAt(offset, u32s, f32Pairs);
+  return offset;
+}
+
+// ---------------------------------------------------------------------
 // 4d-bis. Bind-group cache.
 //
 // createBindGroup is ~0.2 ms in Chromium (validation overhead). With
@@ -397,7 +489,12 @@ export function beginSession(device, model) {
 
     async submit() {
       this._endPass();
+      // Flush any uniforms that ring-aware dispatches staged during the
+      // session — must happen BEFORE the queue.submit so the GPU sees
+      // them when the encoded dispatches read.
+      if (model.uniformRing) model.uniformRing.flush();
       device.queue.submit([this.encoder.finish()]);
+      if (model.uniformRing) model.uniformRing.reset();
       const pool = _ensurePool(model);
       for (const b of this.pendingReleases) pool.release(b);
       this.pendingReleases.length = 0;
@@ -515,8 +612,18 @@ async function _elemBinaryT(device, model, name, a, b) {
 
 async function _elemUnaryT(device, model, name, a, extraF32 = null) {
   const n = a.byteLength / 4;
-  const pipeline = await getPipeline(device, model, name);
   const c = allocTensor(device, model, a.shape, `${name}_out`);
+  // Ring path for ops we've migrated; old path for the rest.
+  if (name === "scalar_mul") {
+    const pipeline = await getRingPipeline(device, model, name, [
+      { binding: 0, type: "read-only-storage" },
+      { binding: 1, type: "storage" },
+    ]);
+    const off = _stageUniforms(device, model, [n], extraF32 !== null ? [[4, extraF32]] : []);
+    _dispatchRing(device, model, pipeline, [a.buffer, c.buffer], off, [Math.ceil(n / 64)]);
+    return c;
+  }
+  const pipeline = await getPipeline(device, model, name);
   const u = _writeUniforms(device, model, [n], extraF32 !== null ? [[4, extraF32]] : []);
   _dispatch(device, model, pipeline, [a.buffer, c.buffer], u, [Math.ceil(n / 64)]);
   _releaseUniform(model, u);
