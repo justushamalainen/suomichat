@@ -661,12 +661,24 @@ export async function linearT(device, model, x, weightName) {
   if (xLastDim < K) {
     throw new Error(`linearT: x last-dim ${xLastDim} < weight K=${K}`);
   }
-  // For T>1 with K < xLastDim, must pass row stride = xLastDim so the
-  // shader skips correctly between rows. For K = xLastDim (the common
-  // case), Kstride = K = xLastDim.
   const Kstride = xLastDim;
-  const pipeline = await getPipeline(device, model, "linear");
   const y = allocTensor(device, model, [M, N], "linear_y");
+
+  // Decode hot path: M=1 gets a specialised shader that actually uses
+  // the GPU (see shaders/linear_m1.wgsl — each workgroup handles one
+  // output element, threads cooperate on the inner K loop). The
+  // generic M>1 path falls back to the naive @workgroup_size(8, 8)
+  // shader which is fine when M amortises the wasted threads.
+  if (M === 1 && Kstride === K && K % 4 === 0) {
+    const pipeline = await getPipeline(device, model, "linear_m1");
+    const u = _writeUniforms(device, model, [K, N]);
+    // Dispatch: ceil(N / TILE_N=8) workgroups, 128 threads each.
+    _dispatch(device, model, pipeline, [x.buffer, w.buffer, y.buffer], u, [Math.ceil(N / 8)]);
+    _releaseUniform(model, u);
+    return y;
+  }
+
+  const pipeline = await getPipeline(device, model, "linear");
   const u = _writeUniforms(device, model, [M, K, N, Kstride]);
   _dispatch(device, model, pipeline, [x.buffer, w.buffer, y.buffer], u,
             [Math.ceil(M / 8), Math.ceil(N / 8)]);
