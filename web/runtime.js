@@ -1206,8 +1206,12 @@ function _pldDraft(tokens, ngramN, maxDraft) {
 }
 
 export async function greedyGenerateSpec(device, model, promptTokens, maxNew, options = {}) {
+  // Defaults picked from a sweep on d6 SFT chat prompts: ngramN=3 gives
+  // fewer but better matches, draftLen=4-8 is the sweet spot (larger
+  // drafts amortise dispatch overhead but waste work on the rejected
+  // tail). draftLen=4 is slightly safer when accept rates are noisy.
   const DRAFT_LEN = options.draftLen ?? 4;
-  const NGRAM_N   = options.ngramN   ?? 2;
+  const NGRAM_N   = options.ngramN   ?? 3;
   if (!Array.isArray(promptTokens) || promptTokens.length === 0) {
     throw new Error("greedyGenerateSpec: promptTokens must be non-empty");
   }
@@ -1270,7 +1274,16 @@ export async function greedyGenerateSpec(device, model, promptTokens, maxNew, op
       else break;
     }
     stats.spec_accepted += accepted;
-    for (let i = 0; i < accepted; i++) out.push(draft[i]);
+    // Commit accepted drafts, but never exceed maxNew.
+    const room = promptTokens.length + maxNew - out.length;
+    const commit = Math.min(accepted, room);
+    for (let i = 0; i < commit; i++) out.push(draft[i]);
+    if (commit < accepted) {
+      // Hit the token budget mid-accept. We still need to rewind cache to
+      // match the tokens we actually kept.
+      cache.seqlens = savedSeqlens + commit + 1;
+      break;
+    }
 
     if (accepted < draft.length) {
       cache.seqlens = savedSeqlens + accepted + 1;

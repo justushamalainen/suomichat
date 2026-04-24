@@ -899,9 +899,7 @@ async def main():
     summary = await run_bench(args.bench_n, 100)
     print(json.dumps(summary, indent=2))
 
-    print("--- bench: speculative decode (PLD) vs plain greedy ---")
-    # Use a prompt that exercises repeated n-grams (chat_e2e output includes
-    # repetitions that trigger PLD matches).
+    print("--- bench: speculative decode (PLD) vs plain greedy — sweep draftLen ---")
     from suomichat.tokenizer import get_tokenizer
     tok = get_tokenizer()
     conv = {"messages": [
@@ -909,14 +907,16 @@ async def main():
         {"role": "assistant", "content": ""},
     ]}
     prompt_ids = tok.render_for_completion(conv)
-    spec_bench = await run_browser_op("bench_spec_decode", {
-        "promptTokens": prompt_ids, "maxNew": 32, "draftLen": 4, "ngramN": 2,
-    })
-    print(json.dumps(spec_bench, indent=2))
-    if spec_bench.get("tokens_match"):
-        acc = spec_bench["stats"]["spec_accepted"] / max(1, spec_bench["stats"]["spec_drafts"])
-        print(f"  accept rate: {acc:.1%}  ({spec_bench['stats']['spec_accepted']}/{spec_bench['stats']['spec_drafts']})")
-        print(f"  speedup: {spec_bench['speedup']:.2f}x")
+    print(f"{'draftLen':>8} {'ngramN':>6} {'ms/tok spec':>12} {'ms/tok plain':>13} {'speedup':>8} {'accept':>12} {'plain':>6} {'match':>6}")
+    for ngram_n in (2, 3):
+        for draft_len in (2, 4, 8, 12):
+            b = await run_browser_op("bench_spec_decode", {
+                "promptTokens": prompt_ids, "maxNew": 32, "draftLen": draft_len, "ngramN": ngram_n,
+            })
+            acc = b["stats"]["spec_accepted"] / max(1, b["stats"]["spec_drafts"])
+            print(f"{draft_len:>8} {ngram_n:>6} {b['ms_per_token_spec']:>12.1f} {b['ms_per_token_greedy']:>13.1f} "
+                  f"{b['speedup']:>8.2f} {b['stats']['spec_accepted']:>4}/{b['stats']['spec_drafts']:<3} ({acc*100:>4.0f}%) "
+                  f"{b['stats']['plain_forwards']:>6} {'✓' if b['tokens_match'] else '✗':>6}")
 
     print("--- bench: prefill batched vs stepwise ---")
     prefill = await run_browser_op("bench_prefill", {"N": 8, "iters": 10})
