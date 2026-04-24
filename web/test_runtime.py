@@ -850,6 +850,14 @@ async def main():
     summary = await run_bench(args.bench_n, 100)
     print(json.dumps(summary, indent=2))
 
+    print("--- bench: prefill batched vs stepwise ---")
+    prefill = await run_browser_op("bench_prefill", {"N": 8, "iters": 10})
+    print(json.dumps(prefill, indent=2))
+    if prefill["speedup"] >= 3.0:
+        print("  ✓ PASS (>= 3x prefill speedup)")
+    else:
+        print(f"  ✗ FAIL prefill speedup {prefill['speedup']:.2f}x < 3x target")
+
     n_pass = sum(passed)
     n_total = len(passed)
     print(f"\n{n_pass}/{n_total} tests passed")

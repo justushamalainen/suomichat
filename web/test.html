@@ -232,6 +232,48 @@ const status = document.getElementById("status");
           // promptTokens (array of int), maxNew (int) → full token list.
           return await greedyGenerate(device, model, args.promptTokens, args.maxNew, args.maxSeqLen);
         }
+        case "bench_prefill": {
+          // Compare forwardBatchT(N tokens) vs N separate forwardT calls.
+          // Returns ms for both + speedup.
+          const N = args.N ?? 8;
+          const tokenIds = Array.from({length: N}, (_, i) => 100 + i);
+          // Warmup
+          {
+            const c = initKVCache(device, model, N + 4);
+            const r = await forwardBatchT(device, model, tokenIds, c);
+            releaseTensor(model, r); destroyKVCache(c);
+          }
+          await device.queue.onSubmittedWorkDone();
+          // Bench batched
+          const tBatch0 = performance.now();
+          for (let it = 0; it < (args.iters ?? 10); it++) {
+            const c = initKVCache(device, model, N + 4);
+            const r = await forwardBatchT(device, model, tokenIds, c);
+            releaseTensor(model, r); destroyKVCache(c);
+          }
+          await device.queue.onSubmittedWorkDone();
+          const dtBatch = performance.now() - tBatch0;
+          // Bench unbatched (N forwardT calls per iter)
+          const tStep0 = performance.now();
+          for (let it = 0; it < (args.iters ?? 10); it++) {
+            const c = initKVCache(device, model, N + 4);
+            for (const tok of tokenIds) {
+              const r = await forwardT(device, model, tok, c);
+              releaseTensor(model, r);
+            }
+            destroyKVCache(c);
+          }
+          await device.queue.onSubmittedWorkDone();
+          const dtStep = performance.now() - tStep0;
+          return {
+            N, iters: args.iters ?? 10,
+            batch_total_ms: dtBatch,
+            stepwise_total_ms: dtStep,
+            batch_per_iter_ms: dtBatch / (args.iters ?? 10),
+            stepwise_per_iter_ms: dtStep / (args.iters ?? 10),
+            speedup: dtStep / dtBatch,
+          };
+        }
         case "bench_forward": {
           // Measure ms/token for the GPU-only forwardT path vs the
           // legacy Float32Array round-tripping forward. Returns total
