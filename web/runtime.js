@@ -820,12 +820,39 @@ export async function downloadU32(device, t) {
 }
 
 // In-GPU buffer copy helper. Used for snapshotting cache.prevEmbedding.
+// Routes through the active session if there is one (so the copy lands
+// in the same encoder as the surrounding compute).
 function copyTensor(device, model, src) {
   const dst = allocTensor(device, model, src.shape, (src.label || "tensor") + "_copy");
-  const enc = device.createCommandEncoder();
-  enc.copyBufferToBuffer(src.buffer, 0, dst.buffer, 0, src.byteLength);
-  device.queue.submit([enc.finish()]);
+  _copyBuffer(device, model, src.buffer, 0, dst.buffer, 0, src.byteLength);
   return dst;
+}
+
+function _copyBuffer(device, model, src, srcOff, dst, dstOff, size) {
+  if (model.activeSession) {
+    model.activeSession.copy(src, srcOff, dst, dstOff, size);
+    return;
+  }
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(src, srcOff, dst, dstOff, size);
+  device.queue.submit([enc.finish()]);
+}
+
+// Pre-load scalar constants (resid_lambdas, x0_lambdas, smear_lambda,
+// backout_lambda) before any session begins. Inside a session the
+// awaiting download would deadlock — the buffer to be read is part of
+// the model weights, but the queue's outstanding work hasn't been
+// submitted yet, so mapAsync would never resolve.
+async function _preloadScalars(device, model) {
+  if (model.scalarsLoaded) return;
+  await ensureScalars(device, model);
+  if (model.tensors.has("smear_lambda") && model.smearLambda === undefined) {
+    model.smearLambda = (await downloadF32(device, model.tensors.get("smear_lambda").buffer, 4))[0];
+  }
+  if (model.tensors.has("backout_lambda") && model.backoutLambda === undefined) {
+    model.backoutLambda = (await downloadF32(device, model.tensors.get("backout_lambda").buffer, 4))[0];
+  }
+  model.scalarsLoaded = true;
 }
 
 // ---------------------------------------------------------------------
@@ -841,26 +868,48 @@ export async function forwardT(device, model, tokenId, cache = null) {
   const n_embd  = cfg.n_embd;
   const T0 = cache ? cache.seqlens : 0;
 
+  // Scalar constants must be downloaded BEFORE the session — once a
+  // session is active, downloads would deadlock (queue work isn't
+  // submitted, mapAsync never resolves).
+  await _preloadScalars(device, model);
+
+  // Pre-fetch any pipelines we'll use mid-session. getPipeline awaits
+  // a fetch on first miss; resolving that inside the session is fine
+  // (no GPU dependency) but pre-fetching keeps the hot path purely
+  // synchronous-style.
+  await getPipeline(device, model, "embedding");
+  await getPipeline(device, model, "rmsnorm");
+  await getPipeline(device, model, "linear");
+  await getPipeline(device, model, "rope");
+  await getPipeline(device, model, "scalar_mul");
+  await getPipeline(device, model, "add");
+  await getPipeline(device, model, "mul");
+  await getPipeline(device, model, "relu2");
+  await getPipeline(device, model, "sigmoid");
+  await getPipeline(device, model, "softcap");
+  await getPipeline(device, model, "softmax");
+  await getPipeline(device, model, "ve_apply");
+  await getPipeline(device, model, "smear_apply");
+  await getPipeline(device, model, "sdpa_scores");
+  await getPipeline(device, model, "sdpa_output");
+
+  const sess = beginSession(device, model);
+
   // 1. Embedding + norm (post-norm, pre-smear)
   let x = await embeddingT(device, model, "transformer.wte.weight", tokenId);
-  x.shape = [1, n_embd];   // reshape view; same buffer
+  x.shape = [1, n_embd];
   const xNormed = await rmsnormT(device, model, x); releaseTensor(model, x);
   x = xNormed;
 
-  // 1b. Smear (decode T=1) — same dance as old forward but on Tensors:
-  //    x_pre_smear = cache.prev;  cache.prev = x;  if x_pre_smear: x += gate * x_pre_smear
+  // 1b. Smear (decode T=1).
   if (cache) {
     const xPreSmear = cache.prevEmbeddingT;
     cache.prevEmbeddingT = copyTensor(device, model, x);
 
     if (xPreSmear !== null) {
-      if (model.smearLambda === undefined) {
-        model.smearLambda = (await downloadF32(device, model.tensors.get("smear_lambda").buffer, 4))[0];
-      }
       const gateRaw    = await linearT  (device, model, x, "smear_gate.weight");
       const gateSig    = await sigmoidT (device, model, gateRaw); releaseTensor(model, gateRaw);
       const gateScaled = await scalarMulT(device, model, gateSig, model.smearLambda); releaseTensor(model, gateSig);
-      // smear_apply does x[i] += gate_scalar[0] * prev[i] in place — no CPU sync.
       const pipeline = await getPipeline(device, model, "smear_apply");
       const u = _writeUniforms(device, model, [n_embd]);
       _dispatch(device, model, pipeline, [gateScaled.buffer, xPreSmear.buffer, x.buffer], u, [Math.ceil(n_embd / 64)]);
@@ -870,7 +919,6 @@ export async function forwardT(device, model, tokenId, cache = null) {
     }
   }
 
-  // x0 baseline = post-smear normalized embedding (snapshot)
   const x0 = copyTensor(device, model, x);
 
   // 2. Transformer blocks
@@ -893,11 +941,8 @@ export async function forwardT(device, model, tokenId, cache = null) {
 
   if (cache) cache.seqlens += 1;
 
-  // 3. Backout subtract: x = x - backout_lambda * x_backout
+  // 3. Backout subtract
   if (xBackout !== null) {
-    if (model.backoutLambda === undefined) {
-      model.backoutLambda = (await downloadF32(device, model.tensors.get("backout_lambda").buffer, 4))[0];
-    }
     const negScaled = await scalarMulT(device, model, xBackout, -model.backoutLambda);
     releaseTensor(model, xBackout);
     const newX = await addT(device, model, x, negScaled); releaseTensor(model, negScaled);
@@ -908,7 +953,9 @@ export async function forwardT(device, model, tokenId, cache = null) {
   const xN = await rmsnormT(device, model, x); releaseTensor(model, x);
   const logitsPadded = await linearT(device, model, xN, "lm_head.weight"); releaseTensor(model, xN);
   const logitsCapped = await softcapT(device, model, logitsPadded, 15.0); releaseTensor(model, logitsPadded);
-  // Slice to true vocab if padded — leave as-is (caller can read first vocab_size)
+
+  // Single submit for the whole forward.
+  await sess.submit();
   return logitsCapped;
 }
 
@@ -1093,10 +1140,8 @@ export async function attentionBlockT(device, model, layerIdx, x, T0 = 0, ve = n
   } else {
     const kvDim = n_kv * head_dim;
     const writeOffset = cache.seqlens * kvDim * 4;
-    const enc = device.createCommandEncoder();
-    enc.copyBufferToBuffer(kS.buffer, 0, cache.kBuffers[layerIdx], writeOffset, kvDim * 4);
-    enc.copyBufferToBuffer(v.buffer,  0, cache.vBuffers[layerIdx], writeOffset, kvDim * 4);
-    device.queue.submit([enc.finish()]);
+    _copyBuffer(device, model, kS.buffer, 0, cache.kBuffers[layerIdx], writeOffset, kvDim * 4);
+    _copyBuffer(device, model, v.buffer,  0, cache.vBuffers[layerIdx], writeOffset, kvDim * 4);
     const Tk = cache.seqlens + 1;
 
     // sdpa_scores: (n_head, Tk)
