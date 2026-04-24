@@ -1159,12 +1159,23 @@ export async function greedyGenerate(device, model, promptTokens, maxNew, maxSeq
   const total = promptTokens.length + maxNew;
   const cache = initKVCache(device, model, maxSeqLen ?? total);
 
-  // Prefill: run forwardT for each prompt token. We only care about the
-  // last one's logits (used to sample token 0 of the generation).
-  let lastLogitsT = null;
-  for (const tok of promptTokens) {
-    if (lastLogitsT) releaseTensor(model, lastLogitsT);
-    lastLogitsT = await forwardT(device, model, tok, cache);
+  // Prefill: one forwardBatchT call (T==prompt length) instead of N
+  // separate forwardT calls. forwardBatchT returns logits for ALL T
+  // positions; we slice the last row (used to sample token 0 of decode).
+  let lastLogitsT;
+  if (promptTokens.length === 1) {
+    lastLogitsT = await forwardT(device, model, promptTokens[0], cache);
+  } else {
+    const allLogitsT = await forwardBatchT(device, model, promptTokens, cache);
+    const T = promptTokens.length;
+    const V = model.config.vocab_size;
+    // Slice last row from (T, V_padded) — copy the V floats into a fresh
+    // pool tensor so we can release the (T, V) tensor.
+    const padded = allLogitsT.byteLength / 4 / T;   // padded vocab from lm_head
+    lastLogitsT = allocTensor(device, model, [padded], "prefill_last");
+    _copyBuffer(device, model, allLogitsT.buffer, (T - 1) * padded * 4,
+                lastLogitsT.buffer, 0, padded * 4);
+    releaseTensor(model, allLogitsT);
   }
 
   // Generate: argmaxT each step on GPU; only the chosen token id (1 int)
