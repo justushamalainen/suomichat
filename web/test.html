@@ -21,7 +21,8 @@ import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul, linear,
          forwardT, releaseTensor, _forward_legacy,
          allocTensor, uploadTensor, downloadTensor,
          softmaxT, beginSession, forwardBatchT,
-         greedyGenerateSpec } from "./runtime.js";
+         greedyGenerateSpec,
+         beginProfiling, endProfiling } from "./runtime.js";
 import { loadTokenizer, decodeTokens, encodeOrdinary, renderForCompletion } from "./tokenizer.js";
 
 const status = document.getElementById("status");
@@ -273,6 +274,35 @@ const status = document.getElementById("status");
             batch_per_iter_ms: dtBatch / (args.iters ?? 10),
             stepwise_per_iter_ms: dtStep / (args.iters ?? 10),
             speedup: dtStep / dtBatch,
+          };
+        }
+        case "bench_profile": {
+          // Runs forwardT N times under the profiler. Returns per-shader
+          // histogram (total_ms, avg_ms, count) summed across all N calls.
+          const N = args.N ?? 20;
+          const tokenId = args.tokenId ?? 100;
+          const cache = initKVCache(device, model, N + 8);
+          // Warmup (pipelines compile, buffers pool up) — NOT profiled
+          await forwardT(device, model, tokenId, cache);
+          await device.queue.onSubmittedWorkDone();
+          beginProfiling(device, model);
+          const t0 = performance.now();
+          for (let i = 0; i < N; i++) {
+            const r = await forwardT(device, model, tokenId, cache);
+            releaseTensor(model, r);
+          }
+          await device.queue.onSubmittedWorkDone();
+          const wallClock_ms = performance.now() - t0;
+          const report = await endProfiling(device, model);
+          destroyKVCache(cache);
+          return {
+            N,
+            wall_ms: wallClock_ms,
+            wall_ms_per_token: wallClock_ms / N,
+            gpu_total_ms: report.total_gpu_ms,
+            gpu_total_ms_per_token: report.total_gpu_ms / N,
+            dispatches_per_token: report.dispatch_count / N,
+            histogram: report.histogram,
           };
         }
         case "bench_forward": {

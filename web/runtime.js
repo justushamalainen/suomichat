@@ -16,7 +16,12 @@ export async function initWebGPU() {
 
   // Request maxBufferSize = 2 GB so we can fit d12 fp32 weights.
   // Default in Chrome is 256 MB which is way too small for ML.
+  // Request timestamp-query if the adapter supports it — gates GPU-side
+  // per-pass profiling (see Profiler class below).
+  const requiredFeatures = [];
+  if (adapter.features.has("timestamp-query")) requiredFeatures.push("timestamp-query");
   const device = await adapter.requestDevice({
+    requiredFeatures,
     requiredLimits: {
       maxStorageBufferBindingSize: Math.min(2 ** 31 - 1, adapter.limits.maxStorageBufferBindingSize),
       maxBufferSize: Math.min(2 ** 31 - 1, adapter.limits.maxBufferSize),
@@ -270,6 +275,119 @@ function _getBindGroup(device, model, pipeline, bufferBindings, uniformsBuf) {
 // defer their pool releases so the same buffer isn't recycled
 // mid-session (would cause RAW/WAW hazards in the same submit).
 // ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// Profiler — GPU-side per-dispatch timings via timestamp-query.
+//
+// WebGPU (as of 2026) only supports timestampWrites at the BEGINNING
+// and END of a compute pass — no in-pass writeTimestamp. So to time
+// each dispatch separately we close and re-open a compute pass around
+// every dispatch. Inside ONE command encoder this costs no extra
+// submits, just a few pass transitions per dispatch. Production code
+// never does this; profiling mode explicitly opts in.
+//
+// Usage (from JS):
+//   beginProfiling(device, model);
+//   await forwardT(...);
+//   const report = await endProfiling(device, model);
+//   // report = { histogram: { shaderName: {count, total_ms, avg_ms, min_ms, max_ms}, ... },
+//   //            total_gpu_ms, dispatch_count }
+//
+// Requires --enable-webgpu-developer-features to get ns resolution.
+// ---------------------------------------------------------------------
+const PROFILE_MAX_TIMESTAMPS = 4096;  // ~2048 dispatches/session — way more than a forward needs
+
+export function beginProfiling(device, model) {
+  if (!device.features.has("timestamp-query")) {
+    console.warn("beginProfiling: adapter lacks timestamp-query, profiling disabled");
+    return null;
+  }
+  if (model.profiler) throw new Error("beginProfiling: already profiling");
+  const querySet = device.createQuerySet({
+    type: "timestamp",
+    count: PROFILE_MAX_TIMESTAMPS,
+  });
+  const resolveBuf = device.createBuffer({
+    size: PROFILE_MAX_TIMESTAMPS * 8,   // 8 bytes per u64 timestamp
+    usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+  });
+  model.profiler = {
+    querySet,
+    resolveBuf,
+    nextIndex: 0,              // next available query slot
+    records: [],               // [{shader, beginIdx, endIdx}]
+    histogram: new Map(),      // shader -> {count, total_ns, min_ns, max_ns}
+    totalGpuNs: 0n,
+  };
+  return model.profiler;
+}
+
+export async function endProfiling(device, model) {
+  const prof = model.profiler;
+  if (!prof) return null;
+  // Pull all histograms into a JSON-friendly object
+  const histogram = {};
+  let total_ms = 0;
+  for (const [name, st] of prof.histogram) {
+    const total_ms_op = Number(st.total_ns) / 1e6;
+    total_ms += total_ms_op;
+    histogram[name] = {
+      count:     st.count,
+      total_ms:  total_ms_op,
+      avg_ms:    total_ms_op / st.count,
+      min_ms:    Number(st.min_ns) / 1e6,
+      max_ms:    Number(st.max_ns) / 1e6,
+    };
+  }
+  prof.querySet.destroy?.();
+  prof.resolveBuf.destroy?.();
+  model.profiler = null;
+  return {
+    histogram,
+    total_gpu_ms:    total_ms,
+    dispatch_count:  Object.values(histogram).reduce((a, h) => a + h.count, 0),
+  };
+}
+
+// Called by session.submit() after the encoder runs. Resolves the
+// QuerySet into the staging buffer, maps it, aggregates (end - begin)
+// per dispatch into the histogram.
+async function _profilerResolve(device, model) {
+  const prof = model.profiler;
+  if (!prof || prof.records.length === 0) return;
+  const tsUsed = prof.nextIndex;
+  const readback = device.createBuffer({
+    size: tsUsed * 8,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  const enc = device.createCommandEncoder();
+  enc.resolveQuerySet(prof.querySet, 0, tsUsed, prof.resolveBuf, 0);
+  enc.copyBufferToBuffer(prof.resolveBuf, 0, readback, 0, tsUsed * 8);
+  device.queue.submit([enc.finish()]);
+  await readback.mapAsync(GPUMapMode.READ);
+  const bigInts = new BigUint64Array(readback.getMappedRange().slice(0));
+  readback.unmap(); readback.destroy();
+
+  for (const rec of prof.records) {
+    const t0 = bigInts[rec.beginIdx];
+    const t1 = bigInts[rec.endIdx];
+    const dt_ns = t1 - t0;
+    const cur = prof.histogram.get(rec.shader);
+    if (cur) {
+      cur.count    += 1;
+      cur.total_ns += dt_ns;
+      if (dt_ns < cur.min_ns) cur.min_ns = dt_ns;
+      if (dt_ns > cur.max_ns) cur.max_ns = dt_ns;
+    } else {
+      prof.histogram.set(rec.shader, {
+        count: 1, total_ns: dt_ns, min_ns: dt_ns, max_ns: dt_ns,
+      });
+    }
+  }
+  // Reset for the next session
+  prof.records.length = 0;
+  prof.nextIndex = 0;
+}
+
 export function beginSession(device, model) {
   if (model.activeSession) throw new Error("beginSession: already in a session");
   const sess = {
@@ -289,6 +407,32 @@ export function beginSession(device, model) {
 
     dispatch(pipeline, bufferBindings, uniformsBuf, dim) {
       const bg = _getBindGroup(device, model, pipeline, bufferBindings, uniformsBuf);
+      // Profiling mode: close the current pass, open a new one with
+      // timestampWrites that brackets just this single dispatch.
+      if (model.profiler) {
+        this._endPass();
+        const prof = model.profiler;
+        if (prof.nextIndex + 2 > PROFILE_MAX_TIMESTAMPS) {
+          throw new Error("profile: ran out of timestamp slots");
+        }
+        const beginIdx = prof.nextIndex;
+        const endIdx   = prof.nextIndex + 1;
+        prof.nextIndex += 2;
+        prof.records.push({ shader: pipeline.label || "?", beginIdx, endIdx });
+        const profPass = this.encoder.beginComputePass({
+          timestampWrites: {
+            querySet: prof.querySet,
+            beginningOfPassWriteIndex: beginIdx,
+            endOfPassWriteIndex:       endIdx,
+          },
+        });
+        profPass.setPipeline(pipeline);
+        profPass.setBindGroup(0, bg);
+        profPass.dispatchWorkgroups(dim[0], dim[1] ?? 1, dim[2] ?? 1);
+        profPass.end();
+        // No lingering pass between dispatches in profile mode
+        return;
+      }
       const pass = this._ensurePass();
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, bg);
@@ -305,6 +449,10 @@ export function beginSession(device, model) {
     async submit() {
       this._endPass();
       device.queue.submit([this.encoder.finish()]);
+      // Profiling: resolve + read timestamps, aggregate into histogram.
+      // Only one session's worth per submit; consecutive sessions
+      // accumulate into the same histogram until endProfiling().
+      if (model.profiler) await _profilerResolve(device, model);
       const pool = _ensurePool(model);
       for (const b of this.pendingReleases) pool.release(b);
       this.pendingReleases.length = 0;
