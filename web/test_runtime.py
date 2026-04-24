@@ -559,6 +559,25 @@ async def test_attention_block(model, layer_idx: int = 0, seed: int = 0, atol: f
     return False
 
 
+async def test_mlp_fused(model, layer_idx: int = 0, seed: int = 0, atol: float = 5e-4):
+    """Compare fused MLP shader vs non-fused. Both should match within
+    fp32 accumulation order drift."""
+    print(f"--- test: mlp_fused layer {layer_idx} ---")
+    g = torch.Generator().manual_seed(seed)
+    n_embd = model.config.n_embd
+    x = torch.randn(1, n_embd, dtype=torch.float32, generator=g).flatten().tolist()
+    fused    = await run_browser_op("mlp_fused", {"layerIdx": layer_idx, "x": x})
+    nonfused = await run_browser_op("mlp",       {"layerIdx": layer_idx, "x": x})
+    import numpy as np
+    diff = float(np.abs(np.array(fused) - np.array(nonfused)).max())
+    print(f"  max abs diff fused vs non-fused: {diff:.3e} (tol {atol:.0e})")
+    if diff <= atol:
+        print("  ✓ PASS")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_mlp_block(model, layer_idx: int = 0, seed: int = 0, atol: float = 5e-4):
     """Verify our mlpBlock against model.transformer.h[i].mlp on a random x."""
     print(f"--- test: mlp_block layer {layer_idx} ---")
@@ -723,6 +742,8 @@ async def main():
     passed.append(await test_linear(model, "transformer.h.0.mlp.c_fc.weight"))  # (3072, 768) d12: 4*n_embd
     passed.append(await test_mlp_block(model, layer_idx=0))
     passed.append(await test_mlp_block(model, layer_idx=model.config.n_layer - 1))   # last layer sanity
+    passed.append(await test_mlp_fused(model, layer_idx=0))
+    passed.append(await test_mlp_fused(model, layer_idx=model.config.n_layer - 1))
     passed.append(await test_attention_block(model, layer_idx=0))               # no value embeds
     passed.append(await test_attention_block(model, layer_idx=1))               # has value embeds
     passed.append(await test_transformer_block(model, layer_idx=0))

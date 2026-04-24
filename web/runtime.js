@@ -1229,6 +1229,27 @@ export async function attentionBlock(device, model, layerIdx, x, T0 = 0, ve = nu
 }
 
 // ---------------------------------------------------------------------
+// Fused MLP — one dispatch instead of three (linear + relu² + linear).
+// Single workgroup of 256 threads. Intermediate `h` lives in workgroup
+// memory (1536 floats = 6 KB for d6). See shaders/mlp_fused.wgsl.
+// ---------------------------------------------------------------------
+export async function mlpFusedT(device, model, layerIdx, x) {
+  const prefix = `transformer.h.${layerIdx}.mlp`;
+  const cfg = model.config;
+  const n_embd = cfg.n_embd;
+  const hidden = 4 * n_embd;
+  const wFc   = model.tensors.get(`${prefix}.c_fc.weight`);
+  const wProj = model.tensors.get(`${prefix}.c_proj.weight`);
+  const pipeline = await getPipeline(device, model, "mlp_fused");
+  const y = allocTensor(device, model, x.shape, "mlp_fused_y");
+  const u = _writeUniforms(device, model, [n_embd, hidden]);
+  _dispatch(device, model, pipeline,
+            [x.buffer, wFc.buffer, wProj.buffer, y.buffer], u, [1]);
+  _releaseUniform(model, u);
+  return y;
+}
+
+// ---------------------------------------------------------------------
 // MLP block (Tensor in/out): y = c_proj(relu²(c_fc(x)))
 // ---------------------------------------------------------------------
 export async function mlpBlockT(device, model, layerIdx, x) {
