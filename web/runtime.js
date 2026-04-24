@@ -211,6 +211,99 @@ export function releaseTensor(model, t) {
 export const POOL_DEBUG_NO_RELEASE = false;
 
 // ---------------------------------------------------------------------
+// 4d-tris. UniformRing — pre-allocated uniform buffer with per-dispatch
+// slots picked via dynamic offset.
+//
+// Why: each `device.queue.writeBuffer` for a 16-byte uniform costs
+// ~0.2 ms (driver+queue overhead). At ~200 dispatches per forward,
+// that's ~40 ms of pure CPU. Replace with: one big uniform buffer,
+// each dispatch reserves a 256-byte slot (the alignment WebGPU
+// requires), JS stages all values into one ArrayBuffer, single
+// writeBuffer at session.submit() time.
+//
+// Each slot is referenced via setBindGroup(group, bg, [dynamicOffset]).
+// The bind group's resource entry pins the ring buffer at offset 0
+// with size SLOT_SIZE; the dynamic offset added at dispatch time
+// addresses the actual slot.
+// ---------------------------------------------------------------------
+const RING_SLOT_SIZE = 256;     // = minUniformBufferOffsetAlignment on most adapters
+const RING_MAX_SLOTS = 256;     // 64 KB total
+
+export class UniformRing {
+  constructor(device) {
+    this.device  = device;
+    this.buffer  = device.createBuffer({
+      label: "uniform_ring",
+      size: RING_SLOT_SIZE * RING_MAX_SLOTS,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.staged  = new ArrayBuffer(RING_SLOT_SIZE * RING_MAX_SLOTS);
+    this.cursor  = 0;            // next slot index
+    this.dirtyTo = 0;            // highest written offset (bytes)
+  }
+  acquireSlot() {
+    if (this.cursor >= RING_MAX_SLOTS) {
+      throw new Error(`UniformRing: out of slots (${RING_MAX_SLOTS}). Increase RING_MAX_SLOTS.`);
+    }
+    const offset = this.cursor * RING_SLOT_SIZE;
+    this.cursor += 1;
+    return offset;
+  }
+  writeAt(offset, u32s, f32Pairs = []) {
+    const view = new DataView(this.staged, offset, RING_SLOT_SIZE);
+    for (let i = 0; i < u32s.length; i++) view.setUint32(i * 4, u32s[i] >>> 0, true);
+    for (const [byteOff, f] of f32Pairs) view.setFloat32(byteOff, f, true);
+    const end = offset + RING_SLOT_SIZE;
+    if (end > this.dirtyTo) this.dirtyTo = end;
+  }
+  flush() {
+    if (this.dirtyTo === 0) return;
+    // Single writeBuffer for all slots that were touched this session.
+    this.device.queue.writeBuffer(this.buffer, 0, this.staged, 0, this.dirtyTo);
+  }
+  reset() { this.cursor = 0; this.dirtyTo = 0; }
+}
+
+function _ensureRing(device, model) {
+  if (!model.uniformRing) model.uniformRing = new UniformRing(device);
+  return model.uniformRing;
+}
+
+// Shared bind-group layout for the @group(1) uniform binding. Reused
+// by every shader's pipeline layout so all shaders bind the same ring
+// buffer (just at different dynamic offsets).
+function _ensureRingBGL(device, model) {
+  if (model.ringBGL) return model.ringBGL;
+  model.ringBGL = device.createBindGroupLayout({
+    label: "uniform_ring_bgl",
+    entries: [{
+      binding: 0,
+      visibility: GPUShaderStage.COMPUTE,
+      buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: RING_SLOT_SIZE },
+    }],
+  });
+  return model.ringBGL;
+}
+
+// Shared bind group for @group(1) — points at the ring buffer, slot
+// size SLOT_SIZE. Same bind group used for every dispatch; just the
+// dynamic offset differs.
+function _ensureRingBG(device, model) {
+  if (model.ringBG) return model.ringBG;
+  const ring = _ensureRing(device, model);
+  const bgl  = _ensureRingBGL(device, model);
+  model.ringBG = device.createBindGroup({
+    label: "uniform_ring_bg",
+    layout: bgl,
+    entries: [{
+      binding: 0,
+      resource: { buffer: ring.buffer, offset: 0, size: RING_SLOT_SIZE },
+    }],
+  });
+  return model.ringBG;
+}
+
+// ---------------------------------------------------------------------
 // 4d-bis. Bind-group cache.
 //
 // createBindGroup is ~0.2 ms in Chromium (validation overhead). With
