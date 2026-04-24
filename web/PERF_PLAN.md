@@ -80,6 +80,37 @@ fails CI).
 - Bench shows ≥5× speedup (forwardT < 30 ms/token on d6).
 - If <5×: investigate, document, mark BLOCKED with the actual numbers.
 
+### Phase 4 results (post-mortem)
+
+Implementation works (30/30 green). Speedup is in the noise (~1.0x).
+
+**Why batching submits didn't help**: I assumed `device.queue.submit`
+overhead was the dominant cost (~0.4 ms × 310 dispatches ≈ 125 ms).
+Wrong. WebGPU's submit is much cheaper than I thought. The actual
+~125 ms floor comes from:
+
+- `device.createBindGroup` per dispatch (~0.2 ms × 310 = 62 ms)
+- `queue.writeBuffer` per uniform (~0.2 ms × 310 = 62 ms)
+
+That work happens whether dispatches are in one submit or 310 — the
+batching collapsed the wrong axis. Remaining axes:
+
+- Reuse bind groups across calls (buffers from the pool come back to
+  the same GPUBuffer object → same bind group)
+- Replace per-dispatch uniform writeBuffer with one big "uniform ring
+  buffer" + dynamic offsets per dispatch
+- Bigger compute per dispatch (tiled matmul)
+- Fewer dispatches (op fusion)
+
+### Phase 4b (NEW) — bind-group cache + uniform-offset reuse
+
+- Cache bind groups by (pipeline, [buffer ids...]) tuple. Pool buffer
+  reuse means many calls hit the same key.
+- Pre-allocate one large UNIFORM | DYNAMIC_OFFSET buffer. Each dispatch
+  writes a 32-byte slot via dynamic offset; one queue.writeBuffer per
+  forward instead of one per dispatch.
+- Acceptance: 30/30 green; bench drops below 60 ms/token (>2x).
+
 ### Phase 5 — greedyGenerate one-session loop
 - Each generation step is one session: forwardT(token, cache, sess) +
   argmaxT(logitsT, sess) + downloadU32(argmaxT) — all in one submit.
