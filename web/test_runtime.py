@@ -416,6 +416,32 @@ async def test_greedy_generate(model, prompt_tokens=(100, 7), max_new: int = 8):
     return False
 
 
+async def test_kv_append_state(kvDim: int = 16, T0: int = 3, maxT: int = 8, seed: int = 0):
+    """State-aware KV append (R3): writes src into cache at row T0 via
+    the decode_state buffer. Verify cache[T0*kvDim : (T0+1)*kvDim] == src
+    and other rows untouched (should stay at the -99 sentinel)."""
+    print(f"--- test: kv_append_state (kvDim={kvDim}, T0={T0}) ---")
+    import numpy as np
+    g = np.random.default_rng(seed)
+    src = g.standard_normal(kvDim).astype(np.float32)
+    cacheSize = maxT * kvDim
+    got = await run_browser_op("kv_append_state", {
+        "src": src.tolist(), "kvDim": kvDim, "T0": T0, "cacheSize": cacheSize,
+    })
+    got = np.array(got, dtype=np.float32)
+    # Verify: row T0 = src, other rows = -99
+    target_row = got[T0 * kvDim : (T0 + 1) * kvDim]
+    row_diff = float(np.abs(target_row - src).max())
+    other = np.concatenate([got[:T0 * kvDim], got[(T0 + 1) * kvDim:]])
+    other_bad = int((other != -99.0).sum())
+    print(f"  target-row max diff: {row_diff:.3e}   other-rows not-(-99): {other_bad}")
+    if row_diff < 1e-6 and other_bad == 0:
+        print("  ✓ PASS")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_embedding_state(model, token_id: int = 100, atol: float = 1e-5):
     """State-aware embedding (R2 infra): same result as embeddingT,
     but token_id read from a separate decode_state uniform buffer."""
@@ -856,6 +882,8 @@ async def main():
     passed.append(await test_forward_batch(model, prompt_tokens=(100, 7, 42, 200)))   # T=4 prefill
     passed.append(await test_embedding_state(model, token_id=100))
     passed.append(await test_embedding_state(model, token_id=42))
+    passed.append(await test_kv_append_state(kvDim=16, T0=3, maxT=8))
+    passed.append(await test_kv_append_state(kvDim=384, T0=5, maxT=16))
     passed.append(await test_greedy_generate(model, prompt_tokens=(100, 7), max_new=8))
     passed.append(await test_tokenizer_decode("Moi! Kuka olet?"))
     passed.append(await test_tokenizer_encode("Moi! Kuka olet?"))

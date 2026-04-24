@@ -517,6 +517,56 @@ export function writeDecodeState(device, state, { token_id = 0, T0 = 0 } = {}) {
   device.queue.writeBuffer(state.buffer, 0, ab);
 }
 
+// State-aware KV cache append. Writes `src` into `cache` at row
+// `state.T0` (which comes from the decode_state buffer, not a
+// per-call uniform). Used instead of copyBufferToBuffer so the append
+// lives in a recorded command buffer.
+export async function kvAppendStateT(device, model, src, cacheBuf, state, kvDim) {
+  const pipeline = await getPipeline(device, model, "kv_append");
+  const u = _writeUniforms(device, model, [kvDim]);
+  if (model.activeSession) {
+    const bg0 = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: src.buffer } },
+        { binding: 1, resource: { buffer: cacheBuf } },
+        { binding: 2, resource: { buffer: u } },
+      ],
+    });
+    const bg1 = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(1),
+      entries: [{ binding: 0, resource: { buffer: state.buffer } }],
+    });
+    const pass = model.activeSession._ensurePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bg0);
+    pass.setBindGroup(1, bg1);
+    pass.dispatchWorkgroups(Math.ceil(kvDim / 64));
+  } else {
+    const bg0 = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: src.buffer } },
+        { binding: 1, resource: { buffer: cacheBuf } },
+        { binding: 2, resource: { buffer: u } },
+      ],
+    });
+    const bg1 = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(1),
+      entries: [{ binding: 0, resource: { buffer: state.buffer } }],
+    });
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bg0);
+    pass.setBindGroup(1, bg1);
+    pass.dispatchWorkgroups(Math.ceil(kvDim / 64));
+    pass.end();
+    device.queue.submit([enc.finish()]);
+  }
+  _releaseUniform(model, u);
+}
+
 // State-aware embedding (reads token_id from state.buffer instead of
 // per-call uniform). Used by the record/replay decode path.
 export async function embeddingStateT(device, model, weightName, state) {
