@@ -103,6 +103,38 @@ Variable-per-token state in the current decode:
   reads/writes. Easy to off-by-one. Test by running 16 tokens and
   comparing to the non-replay path.
 
+## Status update (2026-04-24): R5 BLOCKED
+
+R5 smoke test: a minimal scalar_mul shader recorded into a single
+GPUCommandBuffer; submitted once → correct output; re-submitted with
+either a new uniform value OR a new input storage buffer → same output
+as the first submit. With explicit `await device.queue.onSubmittedWorkDone()`
+between the two submits.
+
+Conclusion: in this Chromium 2026 / Vulkan / RTX 6000 Ada build,
+`device.queue.submit([cmdBuf])` of a previously-submitted cmdBuf is a
+silent no-op. Spec says it should re-execute. It does not.
+
+R5 (record + replay) is **blocked** by this. R6 (bench replay) is
+also blocked. Two valid pivots remain:
+
+- **R5'** — *uniform content cache + bind-group cache + re-encode
+  every forward.* Skip the per-dispatch `writeBuffer` (cache by content
+  hash so repeated identical uniforms are written ONCE), keep the
+  bind-group cache from R4b. Still re-encodes ~180 dispatches per
+  forward but each is cheaper. Estimated savings: ~30 ms (dispatch
+  overhead drops to ~0.4 ms × 180 instead of ~0.65 ms). Decode would
+  go from ~135 ms to ~95-100 ms.
+- **Option C from the brainstorm** — *dynamic-offset uniform ring.*
+  One large uniform buffer, one writeBuffer per forward, every shader
+  rebinds it with a different dynamic offset. Requires every shader
+  to use `@group(1) @binding(0)` for uniforms with explicit pipeline
+  layouts (no more `"auto"`). Bigger refactor, similar gain.
+
+R1-R4 infrastructure (state-aware shaders, ping-pong cache, kv_append,
+state-aware embedding) is still useful for either pivot. None of it
+is wasted.
+
 ## Acceptance per phase
 
 R1–R4: 30/30+ correctness tests still green (including chat_e2e and

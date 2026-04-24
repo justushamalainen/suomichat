@@ -416,6 +416,36 @@ async def test_greedy_generate(model, prompt_tokens=(100, 7), max_new: int = 8):
     return False
 
 
+async def test_cmdbuf_replay_smoke():
+    """Diagnostic: probe whether GPUCommandBuffer reuse works in the
+    current Chromium. Empirically (2026-04-24, Chromium 2026 / Vulkan
+    on RTX 6000 Ada) it does NOT — re-submitting the same cmdBuf is
+    a silent no-op even with explicit queue drain, even when input
+    storage buffers change between submits.
+
+    This test PASSES if r1 is correct (single submit works); the r2
+    result is informational (used to confirm the bug).
+    """
+    print("--- test: cmdbuf_replay_smoke (diagnostic) ---")
+    import numpy as np
+    res = await run_browser_op("cmdbuf_replay_smoke", {})
+    r1 = np.array(res["r1"], dtype=np.float32)
+    r2 = np.array(res["r2"], dtype=np.float32)
+    exp1 = np.array([10, 20, 30, 40], dtype=np.float32)
+    expReuse = np.array([20, 40, 60, 80], dtype=np.float32)   # if reuse worked
+    print(f"  r1 (single submit):       {r1.tolist()}  expect {exp1.tolist()}")
+    print(f"  r2 (same cmdBuf reused):  {r2.tolist()}  reuse-OK would be {expReuse.tolist()}")
+    if np.allclose(r2, expReuse, atol=1e-6):
+        print("  ! cmdBuf reuse APPEARS TO WORK — R5 might be unblocked, retry")
+    else:
+        print("  ! cmdBuf reuse BROKEN (silent no-op) — R5 stays blocked")
+    if np.allclose(r1, exp1, atol=1e-6):
+        print("  ✓ PASS (first-submit baseline correct)")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_smear_state(model, gate: float = 0.3, seed: int = 0):
     """Fused smear+snapshot (R4):
       prev[1] should equal x_input (snapshot)
@@ -914,6 +944,7 @@ async def main():
     passed.append(await test_kv_append_state(kvDim=384, T0=5, maxT=16))
     passed.append(await test_smear_state(model, gate=0.3, seed=0))
     passed.append(await test_smear_state(model, gate=-0.2, seed=1))
+    passed.append(await test_cmdbuf_replay_smoke())
     passed.append(await test_greedy_generate(model, prompt_tokens=(100, 7), max_new=8))
     passed.append(await test_tokenizer_decode("Moi! Kuka olet?"))
     passed.append(await test_tokenizer_encode("Moi! Kuka olet?"))
