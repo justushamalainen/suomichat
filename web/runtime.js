@@ -418,7 +418,12 @@ export function beginSession(device, model) {
         const beginIdx = prof.nextIndex;
         const endIdx   = prof.nextIndex + 1;
         prof.nextIndex += 2;
-        prof.records.push({ shader: pipeline.label || "?", beginIdx, endIdx });
+        // Per-call tag (e.g. linear_m1 with K=768, N=32768) takes priority
+        // over pipeline.label when available. Callers set it on
+        // model.profiler.callTag right before dispatching.
+        const label = prof.callTag || pipeline.label || "?";
+        prof.callTag = null;
+        prof.records.push({ shader: label, beginIdx, endIdx });
         const profPass = this.encoder.beginComputePass({
           timestampWrites: {
             querySet: prof.querySet,
@@ -670,10 +675,17 @@ export async function linearT(device, model, x, weightName) {
   // generic M>1 path falls back to the naive @workgroup_size(8, 8)
   // shader which is fine when M amortises the wasted threads.
   if (M === 1 && Kstride === K && K % 4 === 0) {
+    // Simple vec4 "one thread per output" shader wins for both small
+    // and large K on RTX 6000 Ada at fp32. The K-split shader with
+    // shared memory + barriers (shaders/linear_m1_ksplit.wgsl, kept
+    // for reference) was 3x slower at K=3072. Barrier overhead in
+    // WebGPU/Vulkan on this hardware dwarfs the coalescing gain —
+    // ORT's reports of the K-split winning were with 4-bit quantised
+    // weights (8x less bandwidth), a different regime entirely.
     const pipeline = await getPipeline(device, model, "linear_m1");
     const u = _writeUniforms(device, model, [K, N]);
-    // Dispatch: ceil(N / TILE_N=8) workgroups, 128 threads each.
-    _dispatch(device, model, pipeline, [x.buffer, w.buffer, y.buffer], u, [Math.ceil(N / 8)]);
+    if (model.profiler) model.profiler.callTag = `linear_m1:K=${K},N=${N}`;
+    _dispatch(device, model, pipeline, [x.buffer, w.buffer, y.buffer], u, [Math.ceil(N / 256)]);
     _releaseUniform(model, u);
     return y;
   }
