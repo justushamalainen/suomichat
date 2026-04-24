@@ -192,14 +192,91 @@ export async function downloadTensor(device, t) {
 
 // Return a tensor's buffer to the pool. After this the tensor must not
 // be used again. Safe on non-pooled tensors (no-op).
+//
+// If `model.activeSession` is set, releases are deferred until that
+// session's submit() so the buffer isn't recycled while the GPU may
+// still be reading it from a not-yet-submitted dispatch.
 export function releaseTensor(model, t) {
   if (POOL_DEBUG_NO_RELEASE) return;
-  if (t && t._pooled) _ensurePool(model).release(t.buffer);
+  if (!t || !t._pooled) return;
+  if (model.activeSession) {
+    model.activeSession.deferRelease(t.buffer);
+  } else {
+    _ensurePool(model).release(t.buffer);
+  }
 }
 
 // DEBUG: set true to make releaseTensor a no-op (each tensor gets a
 // fresh buffer; pool only grows). Use to isolate pool-reuse races.
 export const POOL_DEBUG_NO_RELEASE = false;
+
+// ---------------------------------------------------------------------
+// 4e. Session: a single command encoder + lazy compute pass that
+// accumulates many dispatches and submits ONCE.
+//
+// Why: each device.queue.submit has ~0.4 ms driver overhead. A single
+// forwardT issues ~310 dispatches; submitting each one separately
+// burns ~125 ms of pure overhead. Batching them collapses that to one
+// submit per forward.
+//
+// Usage:
+//   const sess = beginSession(device, model);
+//   try {
+//     ... primitives that take sess as last arg ...
+//   } finally {
+//     await sess.submit();   // ends pass, finishes encoder, queue.submit
+//   }
+//
+// While `model.activeSession` is set, releaseTensor + _writeUniforms
+// defer their pool releases so the same buffer isn't recycled
+// mid-session (would cause RAW/WAW hazards in the same submit).
+// ---------------------------------------------------------------------
+export function beginSession(device, model) {
+  if (model.activeSession) throw new Error("beginSession: already in a session");
+  const sess = {
+    device,
+    model,
+    encoder: device.createCommandEncoder({ label: "session" }),
+    pass: null,
+    pendingReleases: [],
+
+    _ensurePass() {
+      if (!this.pass) this.pass = this.encoder.beginComputePass();
+      return this.pass;
+    },
+    _endPass() {
+      if (this.pass) { this.pass.end(); this.pass = null; }
+    },
+
+    dispatch(pipeline, bufferBindings, uniformsBuf, dim) {
+      const entries = bufferBindings.map((b, i) => ({ binding: i, resource: { buffer: b } }));
+      if (uniformsBuf) entries.push({ binding: bufferBindings.length, resource: { buffer: uniformsBuf } });
+      const bg = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
+      const pass = this._ensurePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(dim[0], dim[1] ?? 1, dim[2] ?? 1);
+    },
+
+    copy(src, srcOff, dst, dstOff, size) {
+      this._endPass();   // copy must be outside any compute pass
+      this.encoder.copyBufferToBuffer(src, srcOff, dst, dstOff, size);
+    },
+
+    deferRelease(buf) { this.pendingReleases.push(buf); },
+
+    async submit() {
+      this._endPass();
+      device.queue.submit([this.encoder.finish()]);
+      const pool = _ensurePool(model);
+      for (const b of this.pendingReleases) pool.release(b);
+      this.pendingReleases.length = 0;
+      model.activeSession = null;
+    },
+  };
+  model.activeSession = sess;
+  return sess;
+}
 
 // ---------------------------------------------------------------------
 // 4b. Legacy: turn a Float32Array into a one-shot STORAGE GPUBuffer.
@@ -240,10 +317,28 @@ function _writeUniforms(device, model, u32s, f32Pairs = []) {
   return buf;
 }
 
+// Release a transient uniform buffer. Defers if a session is active so
+// the buffer isn't reused before the submit that consumes it.
+function _releaseUniform(model, buf) {
+  if (model.activeSession) {
+    model.activeSession.deferRelease(buf);
+  } else {
+    _ensurePool(model).release(buf);
+  }
+}
+
 // Submit a single compute dispatch. `bufferBindings` is an array of
 // GPUBuffers in binding-index order (bindings 0..N-1); `uniformsBuf` is
 // bound at the next index. `dispatch` is [x] or [x, y] or [x, y, z].
-function _dispatch(device, pipeline, bufferBindings, uniformsBuf, dispatch) {
+//
+// If `model.activeSession` is set, the dispatch is appended to the
+// session's encoder instead of submitting standalone. Caller passes
+// `model` (we read activeSession from it).
+function _dispatch(device, model, pipeline, bufferBindings, uniformsBuf, dispatch) {
+  if (model.activeSession) {
+    model.activeSession.dispatch(pipeline, bufferBindings, uniformsBuf, dispatch);
+    return;
+  }
   const entries = bufferBindings.map((b, i) => ({ binding: i, resource: { buffer: b } }));
   if (uniformsBuf) entries.push({ binding: bufferBindings.length, resource: { buffer: uniformsBuf } });
   const bg = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
@@ -274,8 +369,8 @@ export async function rmsnormT(device, model, x, eps = 1e-5, rowsOverride = null
   const pipeline = await getPipeline(device, model, "rmsnorm");
   const y = allocTensor(device, model, x.shape, "rmsnorm_y");
   const u = _writeUniforms(device, model, [n], [[4, eps]]);
-  _dispatch(device, pipeline, [x.buffer, y.buffer], u, [rows]);
-  _ensurePool(model).release(u);
+  _dispatch(device, model, pipeline, [x.buffer, y.buffer], u, [rows]);
+  _releaseUniform(model, u);
   return y;
 }
 
@@ -285,8 +380,8 @@ async function _elemBinaryT(device, model, name, a, b) {
   const pipeline = await getPipeline(device, model, name);
   const c = allocTensor(device, model, a.shape, `${name}_out`);
   const u = _writeUniforms(device, model, [n]);
-  _dispatch(device, pipeline, [a.buffer, b.buffer, c.buffer], u, [Math.ceil(n / 64)]);
-  _ensurePool(model).release(u);
+  _dispatch(device, model, pipeline, [a.buffer, b.buffer, c.buffer], u, [Math.ceil(n / 64)]);
+  _releaseUniform(model, u);
   return c;
 }
 
@@ -295,8 +390,8 @@ async function _elemUnaryT(device, model, name, a, extraF32 = null) {
   const pipeline = await getPipeline(device, model, name);
   const c = allocTensor(device, model, a.shape, `${name}_out`);
   const u = _writeUniforms(device, model, [n], extraF32 !== null ? [[4, extraF32]] : []);
-  _dispatch(device, pipeline, [a.buffer, c.buffer], u, [Math.ceil(n / 64)]);
-  _ensurePool(model).release(u);
+  _dispatch(device, model, pipeline, [a.buffer, c.buffer], u, [Math.ceil(n / 64)]);
+  _releaseUniform(model, u);
   return c;
 }
 
@@ -321,9 +416,9 @@ export async function ropeApplyT(device, model, x, T0 = 0, headDim = null) {
   if (!cos || !sin) throw new Error("ropeT: cos/sin missing");
   const y = allocTensor(device, model, x.shape, "rope_y");
   const u = _writeUniforms(device, model, [N, D, d, T0]);
-  _dispatch(device, pipeline, [x.buffer, cos.buffer, sin.buffer, y.buffer], u,
+  _dispatch(device, model, pipeline, [x.buffer, cos.buffer, sin.buffer, y.buffer], u,
             [Math.ceil(N * D / 64)]);
-  _ensurePool(model).release(u);
+  _releaseUniform(model, u);
   return y;
 }
 
@@ -332,8 +427,8 @@ export async function softmaxT(device, model, x, rows, n) {
   const pipeline = await getPipeline(device, model, "softmax");
   const y = allocTensor(device, model, x.shape, "softmax_y");
   const u = _writeUniforms(device, model, [rows, n]);
-  _dispatch(device, pipeline, [x.buffer, y.buffer], u, [rows]);
-  _ensurePool(model).release(u);
+  _dispatch(device, model, pipeline, [x.buffer, y.buffer], u, [rows]);
+  _releaseUniform(model, u);
   return y;
 }
 
@@ -345,8 +440,8 @@ export async function embeddingT(device, model, weightName, tokenId) {
   const pipeline = await getPipeline(device, model, "embedding");
   const y = allocTensor(device, model, [dim], `${weightName}_row`);
   const u = _writeUniforms(device, model, [tokenId, dim, vocab, 0]);
-  _dispatch(device, pipeline, [w.buffer, y.buffer], u, [Math.ceil(dim / 64)]);
-  _ensurePool(model).release(u);
+  _dispatch(device, model, pipeline, [w.buffer, y.buffer], u, [Math.ceil(dim / 64)]);
+  _releaseUniform(model, u);
   return y;
 }
 
@@ -364,9 +459,9 @@ export async function linearT(device, model, x, weightName) {
   const pipeline = await getPipeline(device, model, "linear");
   const y = allocTensor(device, model, [M, N], "linear_y");
   const u = _writeUniforms(device, model, [M, K, N, 0]);
-  _dispatch(device, pipeline, [x.buffer, w.buffer, y.buffer], u,
+  _dispatch(device, model, pipeline, [x.buffer, w.buffer, y.buffer], u,
             [Math.ceil(M / 8), Math.ceil(N / 8)]);
-  _ensurePool(model).release(u);
+  _releaseUniform(model, u);
   return y;
 }
 
@@ -411,8 +506,8 @@ export async function matmulT(device, model, a, b) {
   const pipeline = await getPipeline(device, model, "matmul");
   const c = allocTensor(device, model, [M, N], "matmul_c");
   const u = _writeUniforms(device, model, [M, K, N, 0]);
-  _dispatch(device, pipeline, [a.buffer, b.buffer, c.buffer], u, [Math.ceil(M / 8), Math.ceil(N / 8)]);
-  _ensurePool(model).release(u);
+  _dispatch(device, model, pipeline, [a.buffer, b.buffer, c.buffer], u, [Math.ceil(M / 8), Math.ceil(N / 8)]);
+  _releaseUniform(model, u);
   return c;
 }
 
@@ -705,8 +800,8 @@ export async function argmaxT(device, model, x) {
   const pipeline = await getPipeline(device, model, "argmax");
   const out = allocTensor(device, model, [1], "argmax_out");
   const u = _writeUniforms(device, model, [x.byteLength / 4]);
-  _dispatch(device, pipeline, [x.buffer, out.buffer], u, [1]);
-  _ensurePool(model).release(u);
+  _dispatch(device, model, pipeline, [x.buffer, out.buffer], u, [1]);
+  _releaseUniform(model, u);
   return out;
 }
 
@@ -768,8 +863,8 @@ export async function forwardT(device, model, tokenId, cache = null) {
       // smear_apply does x[i] += gate_scalar[0] * prev[i] in place — no CPU sync.
       const pipeline = await getPipeline(device, model, "smear_apply");
       const u = _writeUniforms(device, model, [n_embd]);
-      _dispatch(device, pipeline, [gateScaled.buffer, xPreSmear.buffer, x.buffer], u, [Math.ceil(n_embd / 64)]);
-      _ensurePool(model).release(u);
+      _dispatch(device, model, pipeline, [gateScaled.buffer, xPreSmear.buffer, x.buffer], u, [Math.ceil(n_embd / 64)]);
+      _releaseUniform(model, u);
       releaseTensor(model, gateScaled);
       releaseTensor(model, xPreSmear);
     }
@@ -1011,10 +1106,10 @@ export async function attentionBlockT(device, model, layerIdx, x, T0 = 0, ve = n
       const u = _writeUniforms(device, model,
         [n_head, n_kv, head_dim, Tk],
         [[16, 1.0 / Math.sqrt(head_dim)]]);
-      _dispatch(device, pipeline,
+      _dispatch(device, model, pipeline,
         [qS.buffer, cache.kBuffers[layerIdx], scoresT.buffer],
         u, [Math.ceil(n_head / 8), Math.ceil(Tk / 8)]);
-      _ensurePool(model).release(u);
+      _releaseUniform(model, u);
     }
     // softmax rows
     const attnW = await softmaxT(device, model, scoresT, n_head, Tk);
@@ -1024,10 +1119,10 @@ export async function attentionBlockT(device, model, layerIdx, x, T0 = 0, ve = n
     {
       const pipeline = await getPipeline(device, model, "sdpa_output");
       const u = _writeUniforms(device, model, [n_head, n_kv, head_dim, Tk]);
-      _dispatch(device, pipeline,
+      _dispatch(device, model, pipeline,
         [attnW.buffer, cache.vBuffers[layerIdx], attnT.buffer],
         u, [Math.ceil(n_head / 8), Math.ceil(head_dim / 8)]);
-      _ensurePool(model).release(u);
+      _releaseUniform(model, u);
     }
     releaseTensor(model, attnW);
     releaseTensor(model, v);
@@ -1083,8 +1178,8 @@ async function veApplyT(device, model, gate, ve, v, head_dim) {
   const numel = v.byteLength / 4;
   const pipeline = await getPipeline(device, model, "ve_apply");
   const u = _writeUniforms(device, model, [numel, head_dim]);
-  _dispatch(device, pipeline, [gate.buffer, ve.buffer, v.buffer], u, [Math.ceil(numel / 64)]);
-  _ensurePool(model).release(u);
+  _dispatch(device, model, pipeline, [gate.buffer, ve.buffer, v.buffer], u, [Math.ceil(numel / 64)]);
+  _releaseUniform(model, u);
 }
 
 export const add       = (d, m, a, b)     => _binWrap(d, m, "add", a, b);
