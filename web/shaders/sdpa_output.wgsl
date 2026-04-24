@@ -9,7 +9,7 @@
 @group(0) @binding(0) var<storage, read>       attn:     array<f32>;
 @group(0) @binding(1) var<storage, read>       v_cache:  array<f32>;
 @group(0) @binding(2) var<storage, read_write> out:      array<f32>;
-@group(0) @binding(3) var<uniform>             params:   Params;
+@group(1) @binding(0) var<uniform>             params:   Params;
 
 struct Params {
     nH:        u32,

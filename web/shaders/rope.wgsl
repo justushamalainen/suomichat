@@ -19,7 +19,7 @@
 @group(0) @binding(1) var<storage, read>       cos_t:  array<f32>;
 @group(0) @binding(2) var<storage, read>       sin_t:  array<f32>;
 @group(0) @binding(3) var<storage, read_write> y:      array<f32>;
-@group(0) @binding(4) var<uniform>             params: Params;
+@group(1) @binding(0) var<uniform>             params: Params;
 
 struct Params {
     N:  u32,   // total rows (T * H)

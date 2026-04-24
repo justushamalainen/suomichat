@@ -582,51 +582,38 @@ function _dispatch(device, model, pipeline, bufferBindings, uniformsBuf, dispatc
 // thin wrappers over these.
 // ---------------------------------------------------------------------
 
-// RMSNorm. x shape (..., n). Each row of length `n` is normalised
-// independently. Defaults: `n` = x.shape[-1], `rows` = numel / n.
-// Both can be overridden — useful for per-head QK norm where the
-// tensor is laid out as (n_head * head_dim) flat and you want each
-// head's `head_dim` slice normalized separately.
 export async function rmsnormT(device, model, x, eps = 1e-5, rowsOverride = null, nOverride = null) {
   const n = nOverride ?? x.shape[x.shape.length - 1];
   const numel = x.byteLength / 4;
   const rows = rowsOverride ?? (numel / n);
-  const pipeline = await getPipeline(device, model, "rmsnorm");
   const y = allocTensor(device, model, x.shape, "rmsnorm_y");
-  const u = _writeUniforms(device, model, [n], [[4, eps]]);
-  _dispatch(device, model, pipeline, [x.buffer, y.buffer], u, [rows]);
-  _releaseUniform(model, u);
+  const pipeline = await getRingPipeline(device, model, "rmsnorm", _S2_RW);
+  const off = _stageUniforms(device, model, [n], [[4, eps]]);
+  _dispatchRing(device, model, pipeline, [x.buffer, y.buffer], off, [rows]);
   return y;
 }
+
+// Storage-layout shorthands for the ring path.
+const _S2_RW = [{binding:0,type:"read-only-storage"},{binding:1,type:"storage"}];
+const _S3_RW = [{binding:0,type:"read-only-storage"},{binding:1,type:"read-only-storage"},{binding:2,type:"storage"}];
+const _S4_RW = [{binding:0,type:"read-only-storage"},{binding:1,type:"read-only-storage"},{binding:2,type:"read-only-storage"},{binding:3,type:"storage"}];
 
 async function _elemBinaryT(device, model, name, a, b) {
   if (a.byteLength !== b.byteLength) throw new Error(`${name}T: shape mismatch ${a.byteLength} vs ${b.byteLength}`);
   const n = a.byteLength / 4;
-  const pipeline = await getPipeline(device, model, name);
   const c = allocTensor(device, model, a.shape, `${name}_out`);
-  const u = _writeUniforms(device, model, [n]);
-  _dispatch(device, model, pipeline, [a.buffer, b.buffer, c.buffer], u, [Math.ceil(n / 64)]);
-  _releaseUniform(model, u);
+  const pipeline = await getRingPipeline(device, model, name, _S3_RW);
+  const off = _stageUniforms(device, model, [n]);
+  _dispatchRing(device, model, pipeline, [a.buffer, b.buffer, c.buffer], off, [Math.ceil(n / 64)]);
   return c;
 }
 
 async function _elemUnaryT(device, model, name, a, extraF32 = null) {
   const n = a.byteLength / 4;
   const c = allocTensor(device, model, a.shape, `${name}_out`);
-  // Ring path for ops we've migrated; old path for the rest.
-  if (name === "scalar_mul") {
-    const pipeline = await getRingPipeline(device, model, name, [
-      { binding: 0, type: "read-only-storage" },
-      { binding: 1, type: "storage" },
-    ]);
-    const off = _stageUniforms(device, model, [n], extraF32 !== null ? [[4, extraF32]] : []);
-    _dispatchRing(device, model, pipeline, [a.buffer, c.buffer], off, [Math.ceil(n / 64)]);
-    return c;
-  }
-  const pipeline = await getPipeline(device, model, name);
-  const u = _writeUniforms(device, model, [n], extraF32 !== null ? [[4, extraF32]] : []);
-  _dispatch(device, model, pipeline, [a.buffer, c.buffer], u, [Math.ceil(n / 64)]);
-  _releaseUniform(model, u);
+  const pipeline = await getRingPipeline(device, model, name, _S2_RW);
+  const off = _stageUniforms(device, model, [n], extraF32 !== null ? [[4, extraF32]] : []);
+  _dispatchRing(device, model, pipeline, [a.buffer, c.buffer], off, [Math.ceil(n / 64)]);
   return c;
 }
 
@@ -646,25 +633,22 @@ export async function ropeApplyT(device, model, x, T0 = 0, headDim = null, heads
   const numel = x.byteLength / 4;
   const N = numel / D;
   const d = D / 2;
-  const H = headsPerToken ?? N;     // T=1 → all rows pos T0; T>1 → pass n_head/n_kv
-  const pipeline = await getPipeline(device, model, "rope");
+  const H = headsPerToken ?? N;
   const cos = model.tensors.get("cos"), sin = model.tensors.get("sin");
   if (!cos || !sin) throw new Error("ropeT: cos/sin missing");
   const y = allocTensor(device, model, x.shape, "rope_y");
-  const u = _writeUniforms(device, model, [N, D, d, T0, H]);
-  _dispatch(device, model, pipeline, [x.buffer, cos.buffer, sin.buffer, y.buffer], u,
-            [Math.ceil(N * D / 64)]);
-  _releaseUniform(model, u);
+  const pipeline = await getRingPipeline(device, model, "rope", _S4_RW);
+  const off = _stageUniforms(device, model, [N, D, d, T0, H]);
+  _dispatchRing(device, model, pipeline, [x.buffer, cos.buffer, sin.buffer, y.buffer], off,
+                [Math.ceil(N * D / 64)]);
   return y;
 }
 
-// Row-wise softmax. x shape (rows, n).
 export async function softmaxT(device, model, x, rows, n) {
-  const pipeline = await getPipeline(device, model, "softmax");
   const y = allocTensor(device, model, x.shape, "softmax_y");
-  const u = _writeUniforms(device, model, [rows, n]);
-  _dispatch(device, model, pipeline, [x.buffer, y.buffer], u, [rows]);
-  _releaseUniform(model, u);
+  const pipeline = await getRingPipeline(device, model, "softmax", _S2_RW);
+  const off = _stageUniforms(device, model, [rows, n]);
+  _dispatchRing(device, model, pipeline, [x.buffer, y.buffer], off, [rows]);
   return y;
 }
 
@@ -674,18 +658,16 @@ export async function embeddingBatchT(device, model, weightName, tokenIds) {
   if (!w) throw new Error(`embeddingBatchT: ${weightName} missing`);
   const [vocab, dim] = w.shape;
   const T = tokenIds.length;
-  const pipeline = await getPipeline(device, model, "embedding_batch");
-  // Upload token IDs as u32 buffer (also via pool)
   const idBytes = T * 4;
   const idBuf = _ensurePool(model).acquire(device, Math.max(idBytes, 16),
                   GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
                   "tokenIds");
   device.queue.writeBuffer(idBuf, 0, new Uint32Array(tokenIds));
   const y = allocTensor(device, model, [T, dim], `${weightName}_batch`);
-  const u = _writeUniforms(device, model, [T, dim, vocab]);
-  _dispatch(device, model, pipeline, [w.buffer, idBuf, y.buffer], u,
-            [Math.ceil(T * dim / 64)]);
-  _releaseUniform(model, u);
+  const pipeline = await getRingPipeline(device, model, "embedding_batch", _S3_RW);
+  const off = _stageUniforms(device, model, [T, dim, vocab]);
+  _dispatchRing(device, model, pipeline, [w.buffer, idBuf, y.buffer], off,
+                [Math.ceil(T * dim / 64)]);
   if (model.activeSession) model.activeSession.deferRelease(idBuf);
   else _ensurePool(model).release(idBuf);
   return y;
@@ -824,16 +806,14 @@ export async function embeddingStateT(device, model, weightName, state) {
   return y;
 }
 
-// Embedding lookup: a row of `weightName`. Returns Tensor of shape (dim,).
 export async function embeddingT(device, model, weightName, tokenId) {
   const w = model.tensors.get(weightName);
   if (!w) throw new Error(`embeddingT: ${weightName} missing`);
   const [vocab, dim] = w.shape;
-  const pipeline = await getPipeline(device, model, "embedding");
   const y = allocTensor(device, model, [dim], `${weightName}_row`);
-  const u = _writeUniforms(device, model, [tokenId, dim, vocab, 0]);
-  _dispatch(device, model, pipeline, [w.buffer, y.buffer], u, [Math.ceil(dim / 64)]);
-  _releaseUniform(model, u);
+  const pipeline = await getRingPipeline(device, model, "embedding", _S2_RW);
+  const off = _stageUniforms(device, model, [tokenId, dim, vocab, 0]);
+  _dispatchRing(device, model, pipeline, [w.buffer, y.buffer], off, [Math.ceil(dim / 64)]);
   return y;
 }
 
@@ -846,16 +826,12 @@ export async function linearT(device, model, x, weightName) {
   if (xLastDim < K) {
     throw new Error(`linearT: x last-dim ${xLastDim} < weight K=${K}`);
   }
-  // For T>1 with K < xLastDim, must pass row stride = xLastDim so the
-  // shader skips correctly between rows. For K = xLastDim (the common
-  // case), Kstride = K = xLastDim.
   const Kstride = xLastDim;
-  const pipeline = await getPipeline(device, model, "linear");
   const y = allocTensor(device, model, [M, N], "linear_y");
-  const u = _writeUniforms(device, model, [M, K, N, Kstride]);
-  _dispatch(device, model, pipeline, [x.buffer, w.buffer, y.buffer], u,
-            [Math.ceil(M / 8), Math.ceil(N / 8)]);
-  _releaseUniform(model, u);
+  const pipeline = await getRingPipeline(device, model, "linear", _S3_RW);
+  const off = _stageUniforms(device, model, [M, K, N, Kstride]);
+  _dispatchRing(device, model, pipeline, [x.buffer, w.buffer, y.buffer], off,
+                [Math.ceil(M / 8), Math.ceil(N / 8)]);
   return y;
 }
 
@@ -897,11 +873,10 @@ export async function embeddingLookup(device, model, tokenId) {
 export async function matmulT(device, model, a, b) {
   const [M, K] = a.shape, [K2, N] = b.shape;
   if (K !== K2) throw new Error(`matmulT: (${M},${K}) @ (${K2},${N})`);
-  const pipeline = await getPipeline(device, model, "matmul");
   const c = allocTensor(device, model, [M, N], "matmul_c");
-  const u = _writeUniforms(device, model, [M, K, N, 0]);
-  _dispatch(device, model, pipeline, [a.buffer, b.buffer, c.buffer], u, [Math.ceil(M / 8), Math.ceil(N / 8)]);
-  _releaseUniform(model, u);
+  const pipeline = await getRingPipeline(device, model, "matmul", _S3_RW);
+  const off = _stageUniforms(device, model, [M, K, N, 0]);
+  _dispatchRing(device, model, pipeline, [a.buffer, b.buffer, c.buffer], off, [Math.ceil(M / 8), Math.ceil(N / 8)]);
   return c;
 }
 
@@ -1346,10 +1321,9 @@ export async function forwardT(device, model, tokenId, cache = null) {
       const gateRaw    = await linearT  (device, model, x, "smear_gate.weight");
       const gateSig    = await sigmoidT (device, model, gateRaw); releaseTensor(model, gateRaw);
       const gateScaled = await scalarMulT(device, model, gateSig, model.smearLambda); releaseTensor(model, gateSig);
-      const pipeline = await getPipeline(device, model, "smear_apply");
-      const u = _writeUniforms(device, model, [n_embd]);
-      _dispatch(device, model, pipeline, [gateScaled.buffer, xPreSmear.buffer, x.buffer], u, [Math.ceil(n_embd / 64)]);
-      _releaseUniform(model, u);
+      const pipeline = await getRingPipeline(device, model, "smear_apply", _S3_RW);
+      const off = _stageUniforms(device, model, [n_embd]);
+      _dispatchRing(device, model, pipeline, [gateScaled.buffer, xPreSmear.buffer, x.buffer], off, [Math.ceil(n_embd / 64)]);
       releaseTensor(model, gateScaled);
       releaseTensor(model, xPreSmear);
     }
@@ -1460,11 +1434,10 @@ export async function forwardBatchT(device, model, tokenIds, cache = null) {
     const gateScaled = await scalarMulT(device, model, gateSig, model.smearLambda); releaseTensor(model, gateSig);
     const xSmeared = allocTensor(device, model, [T, n_embd], "smeared");
     {
-      const pipeline = await getPipeline(device, model, "smear_apply_t");
-      const u = _writeUniforms(device, model, [T, n_embd]);
-      _dispatch(device, model, pipeline, [gateScaled.buffer, x.buffer, xSmeared.buffer], u,
-                [Math.ceil(T * n_embd / 64)]);
-      _releaseUniform(model, u);
+      const pipeline = await getRingPipeline(device, model, "smear_apply_t", _S3_RW);
+      const off = _stageUniforms(device, model, [T, n_embd]);
+      _dispatchRing(device, model, pipeline, [gateScaled.buffer, x.buffer, xSmeared.buffer], off,
+                    [Math.ceil(T * n_embd / 64)]);
     }
     releaseTensor(model, gateScaled);
     releaseTensor(model, x);
@@ -1620,10 +1593,9 @@ export async function attentionBlockBatchT(device, model, layerIdx, x, T, T0, ve
     // ve_apply_t: v[t, h, d] += gate[t, h] * ve[t, h, d]
     {
       const numel = T * kvDim;
-      const pipeline = await getPipeline(device, model, "ve_apply_t");
-      const u = _writeUniforms(device, model, [numel, head_dim, n_kv]);
-      _dispatch(device, model, pipeline, [gateTriple.buffer, ve.buffer, v.buffer], u, [Math.ceil(numel / 64)]);
-      _releaseUniform(model, u);
+      const pipeline = await getRingPipeline(device, model, "ve_apply_t", _S3_RW);
+      const off = _stageUniforms(device, model, [numel, head_dim, n_kv]);
+      _dispatchRing(device, model, pipeline, [gateTriple.buffer, ve.buffer, v.buffer], off, [Math.ceil(numel / 64)]);
     }
     releaseTensor(model, gateTriple);
   }
@@ -1651,25 +1623,23 @@ export async function attentionBlockBatchT(device, model, layerIdx, x, T, T0, ve
   const Tk_valid = Tk;
   const scoresT = allocTensor(device, model, [T, n_head, Tk], "sdpa_scores_batch");
   {
-    const pipeline = await getPipeline(device, model, "sdpa_scores");
-    const u = _writeUniforms(device, model,
+    const pipeline = await getRingPipeline(device, model, "sdpa_scores", _S3_RW);
+    const off = _stageUniforms(device, model,
       [n_head, n_kv, head_dim, Tk, T, T0, /*scale*/ 0, Tk_valid],
       [[24, 1.0 / Math.sqrt(head_dim)]]);
-    _dispatch(device, model, pipeline,
+    _dispatchRing(device, model, pipeline,
       [qS.buffer, cache.kBuffers[layerIdx], scoresT.buffer],
-      u, [Math.ceil(T * n_head / 8), Math.ceil(Tk / 8)]);
-    _releaseUniform(model, u);
+      off, [Math.ceil(T * n_head / 8), Math.ceil(Tk / 8)]);
   }
   const attnW = await softmaxT(device, model, scoresT, T * n_head, Tk);
   releaseTensor(model, scoresT);
   const attnT = allocTensor(device, model, [T, n_head * head_dim], "sdpa_out_batch");
   {
-    const pipeline = await getPipeline(device, model, "sdpa_output");
-    const u = _writeUniforms(device, model, [n_head, n_kv, head_dim, Tk, T, Tk_valid]);
-    _dispatch(device, model, pipeline,
+    const pipeline = await getRingPipeline(device, model, "sdpa_output", _S3_RW);
+    const off = _stageUniforms(device, model, [n_head, n_kv, head_dim, Tk, T, Tk_valid]);
+    _dispatchRing(device, model, pipeline,
       [attnW.buffer, cache.vBuffers[layerIdx], attnT.buffer],
-      u, [Math.ceil(T * n_head / 8), Math.ceil(head_dim / 8)]);
-    _releaseUniform(model, u);
+      off, [Math.ceil(T * n_head / 8), Math.ceil(head_dim / 8)]);
   }
   releaseTensor(model, attnW);
   releaseTensor(model, v);
@@ -1823,25 +1793,23 @@ export async function attentionBlockT(device, model, layerIdx, x, T0 = 0, ve = n
     const Tk_valid = Tk;
     const scoresT = allocTensor(device, model, [T, n_head, Tk], "sdpa_scores");
     {
-      const pipeline = await getPipeline(device, model, "sdpa_scores");
-      const u = _writeUniforms(device, model,
+      const pipeline = await getRingPipeline(device, model, "sdpa_scores", _S3_RW);
+      const off = _stageUniforms(device, model,
         [n_head, n_kv, head_dim, Tk, T, T0, /*scale*/ 0, Tk_valid],
         [[24, 1.0 / Math.sqrt(head_dim)]]);
-      _dispatch(device, model, pipeline,
+      _dispatchRing(device, model, pipeline,
         [qS.buffer, cache.kBuffers[layerIdx], scoresT.buffer],
-        u, [Math.ceil(T * n_head / 8), Math.ceil(Tk / 8)]);
-      _releaseUniform(model, u);
+        off, [Math.ceil(T * n_head / 8), Math.ceil(Tk / 8)]);
     }
     const attnW = await softmaxT(device, model, scoresT, T * n_head, Tk);
     releaseTensor(model, scoresT);
     attnT = allocTensor(device, model, [T, n_head * head_dim], "sdpa_out");
     {
-      const pipeline = await getPipeline(device, model, "sdpa_output");
-      const u = _writeUniforms(device, model, [n_head, n_kv, head_dim, Tk, T, Tk_valid]);
-      _dispatch(device, model, pipeline,
+      const pipeline = await getRingPipeline(device, model, "sdpa_output", _S3_RW);
+      const off = _stageUniforms(device, model, [n_head, n_kv, head_dim, Tk, T, Tk_valid]);
+      _dispatchRing(device, model, pipeline,
         [attnW.buffer, cache.vBuffers[layerIdx], attnT.buffer],
-        u, [Math.ceil(T * n_head / 8), Math.ceil(head_dim / 8)]);
-      _releaseUniform(model, u);
+        off, [Math.ceil(T * n_head / 8), Math.ceil(head_dim / 8)]);
     }
     releaseTensor(model, attnW);
     releaseTensor(model, v);
@@ -1895,10 +1863,9 @@ export async function mlpBlock(device, model, layerIdx, x) {
 // ---------------------------------------------------------------------
 async function veApplyT(device, model, gate, ve, v, head_dim) {
   const numel = v.byteLength / 4;
-  const pipeline = await getPipeline(device, model, "ve_apply");
-  const u = _writeUniforms(device, model, [numel, head_dim]);
-  _dispatch(device, model, pipeline, [gate.buffer, ve.buffer, v.buffer], u, [Math.ceil(numel / 64)]);
-  _releaseUniform(model, u);
+  const pipeline = await getRingPipeline(device, model, "ve_apply", _S3_RW);
+  const off = _stageUniforms(device, model, [numel, head_dim]);
+  _dispatchRing(device, model, pipeline, [gate.buffer, ve.buffer, v.buffer], off, [Math.ceil(numel / 64)]);
 }
 
 export const add       = (d, m, a, b)     => _binWrap(d, m, "add", a, b);

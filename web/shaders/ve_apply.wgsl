@@ -12,7 +12,7 @@
 @group(0) @binding(0) var<storage, read>       gate: array<f32>;
 @group(0) @binding(1) var<storage, read>       ve:   array<f32>;
 @group(0) @binding(2) var<storage, read_write> v:    array<f32>;
-@group(0) @binding(3) var<uniform>             p:    Params;
+@group(1) @binding(0) var<uniform>             p:    Params;
 
 struct Params {
     numel:    u32,

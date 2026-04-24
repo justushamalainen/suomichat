@@ -2,7 +2,7 @@
 
 @group(0) @binding(0) var<storage, read>       a:      array<f32>;
 @group(0) @binding(1) var<storage, read_write> c:      array<f32>;
-@group(0) @binding(2) var<uniform>             params: Params;
+@group(1) @binding(0) var<uniform>             params: Params;
 
 struct Params { n: u32, _p0: u32, _p1: u32, _p2: u32, };
 

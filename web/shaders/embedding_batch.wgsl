@@ -10,7 +10,7 @@
 @group(0) @binding(0) var<storage, read>       wte:        array<f32>;
 @group(0) @binding(1) var<storage, read>       token_ids:  array<u32>;
 @group(0) @binding(2) var<storage, read_write> out:        array<f32>;
-@group(0) @binding(3) var<uniform>             p:          Params;
+@group(1) @binding(0) var<uniform>             p:          Params;
 
 struct Params {
     T:      u32,

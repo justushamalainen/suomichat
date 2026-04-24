@@ -9,7 +9,7 @@
 @group(0) @binding(0) var<storage, read>       gate_scalar: array<f32>;
 @group(0) @binding(1) var<storage, read>       prev:        array<f32>;
 @group(0) @binding(2) var<storage, read_write> x:           array<f32>;
-@group(0) @binding(3) var<uniform>             p:           Params;
+@group(1) @binding(0) var<uniform>             p:           Params;
 
 struct Params {
     n:   u32,
