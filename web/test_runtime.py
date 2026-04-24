@@ -607,6 +607,38 @@ async def test_linear(model, weight_name: str, seed: int = 0, atol: float = 5e-4
     return False
 
 
+async def test_rope_multi(model, T: int = 4, T0: int = 5, seed: int = 0, atol: float = 1e-5):
+    """Multi-position RoPE: T tokens, n_head heads each, positions T0..T0+T-1."""
+    print(f"--- test: rope_multi (T={T}, T0={T0}) ---")
+    g = torch.Generator().manual_seed(seed)
+    head_dim = model.config.n_embd // model.config.n_head
+    n_head   = model.config.n_head
+    # x shape (1, T, n_head, head_dim)
+    x = torch.randn(1, T, n_head, head_dim, dtype=torch.float32, generator=g)
+    # PyTorch ref: per-token RoPE
+    ref_chunks = []
+    for t in range(T):
+        cos = model.cos[:, T0+t:T0+t+1]
+        sin = model.sin[:, T0+t:T0+t+1]
+        rot = ref_rope(x[:, t:t+1], cos, sin)
+        ref_chunks.append(rot.flatten())
+    ref = torch.cat(ref_chunks).numpy()
+
+    # Browser: pass flat (N=T*n_head, D=head_dim) with H=n_head
+    got = await run_browser_op("rope", {
+        "x": x.flatten().tolist(),
+        "N": T * n_head, "D": head_dim, "T0": T0, "H": n_head,
+    })
+    got = torch.tensor(got, dtype=torch.float32).numpy()
+    diff = abs(ref - got).max()
+    print(f"  max abs diff: {diff:.3e} (tol {atol:.0e})")
+    if diff <= atol:
+        print("  ✓ PASS")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_rope(model, seed: int = 0, T0: int = 0, atol: float = 1e-5):
     print(f"--- test: rope (T0={T0}) ---")
     g = torch.Generator().manual_seed(seed)
@@ -719,6 +751,7 @@ async def main():
     passed.append(await test_elementwise(seed=0, n=768))              # add/mul/scalar_mul/relu2/sigmoid
     passed.append(await test_rope(model, seed=0, T0=0))
     passed.append(await test_rope(model, seed=1, T0=17))              # non-zero offset
+    passed.append(await test_rope_multi(model, T=4, T0=5))           # T>1 prefill
     passed.append(await test_linear(model, "transformer.h.0.attn.c_q.weight"))  # (768, 768)
     passed.append(await test_linear(model, "transformer.h.0.mlp.c_fc.weight"))  # (3072, 768) d12: 4*n_embd
     passed.append(await test_mlp_block(model, layer_idx=0))

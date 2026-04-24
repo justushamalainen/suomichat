@@ -440,17 +440,18 @@ export const softcapT   = (d, m, a, cap = 15)  => _elemUnaryT (d, m, "softcap", 
 // RoPE on Tensor x. The shader treats x as (N, D) where D = head_dim
 // (NOT n_embd). When x is laid out flat as (n_head*head_dim,) you MUST
 // pass headDim explicitly so the rotation operates per-head.
-export async function ropeApplyT(device, model, x, T0 = 0, headDim = null) {
+export async function ropeApplyT(device, model, x, T0 = 0, headDim = null, headsPerToken = null) {
   const D = headDim ?? x.shape[x.shape.length - 1];
   if (D % 2 !== 0) throw new Error("ropeT: D must be even");
   const numel = x.byteLength / 4;
   const N = numel / D;
   const d = D / 2;
+  const H = headsPerToken ?? N;     // T=1 → all rows pos T0; T>1 → pass n_head/n_kv
   const pipeline = await getPipeline(device, model, "rope");
   const cos = model.tensors.get("cos"), sin = model.tensors.get("sin");
   if (!cos || !sin) throw new Error("ropeT: cos/sin missing");
   const y = allocTensor(device, model, x.shape, "rope_y");
-  const u = _writeUniforms(device, model, [N, D, d, T0]);
+  const u = _writeUniforms(device, model, [N, D, d, T0, H]);
   _dispatch(device, model, pipeline, [x.buffer, cos.buffer, sin.buffer, y.buffer], u,
             [Math.ceil(N * D / 64)]);
   _releaseUniform(model, u);
@@ -589,9 +590,9 @@ export async function linear(device, model, x, M, K, weightName) {
 }
 
 // Float32Array wrapper around ropeApplyT.
-export async function ropeApply(device, model, x, N, D, T0 = 0) {
+export async function ropeApply(device, model, x, N, D, T0 = 0, H = null) {
   const xT = uploadTensor(device, model, x, [N, D], "rope_x");
-  const yT = await ropeApplyT(device, model, xT, T0);
+  const yT = await ropeApplyT(device, model, xT, T0, D, H);
   const out = await downloadTensor(device, yT);
   releaseTensor(model, xT); releaseTensor(model, yT);
   return out;

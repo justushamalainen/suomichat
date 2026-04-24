@@ -74,7 +74,7 @@ const status = document.getElementById("status");
           return Array.from(r);
         }
         case "rope": {
-          const r = await ropeApply(device, model, new Float32Array(args.x), args.N, args.D, args.T0);
+          const r = await ropeApply(device, model, new Float32Array(args.x), args.N, args.D, args.T0, args.H);
           return Array.from(r);
         }
         case "linear": {

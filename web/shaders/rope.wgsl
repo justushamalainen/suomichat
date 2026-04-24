@@ -1,13 +1,14 @@
 // Rotary position embedding application.
 //
-// Input x is a flattened tensor of shape (N, D) where N = B*T*H
-// (flattened across batch, time, head) and D = head_dim.
-// cos/sin are flat arrays of shape (rotary_seq_len, d) where d = D/2.
+// Input x is a flattened tensor of shape (N, D) where N = T*H
+// (time × heads, flat) and D = head_dim. cos/sin are flat arrays of
+// shape (rotary_seq_len, d) where d = D/2.
 //
-// For each (n, i) in (N, D):
-//   t = T0 + (n / H)     — but for our T=1 path N=H and t=T0 for all n
-//   For Phase 5 we simplify: pass T0 as uniform, assume all N share the
-//   same position. Multi-position RoPE (T>1 prefill) comes later.
+// Per-row position: row n has token index (n / H), so its position is
+// T0 + (n / H). For T=1 (decode), H=N → all rows get position T0
+// (backward compatible with the old single-position path).
+// For T>1 (prefill), pass H = n_head/n_kv so each token's heads share
+// a position, and consecutive tokens get consecutive positions.
 //
 // Rotation formulation (matches suomichat/gpt.py:apply_rotary_emb):
 //   y1[i]   = x1[i] * cos[i] + x2[i] * sin[i]   for i in 0..d
@@ -21,10 +22,14 @@
 @group(0) @binding(4) var<uniform>             params: Params;
 
 struct Params {
-    N:  u32,   // number of (b, t, h) positions
+    N:  u32,   // total rows (T * H)
     D:  u32,   // head_dim
     d:  u32,   // D/2
-    T0: u32,   // time-position offset into cos/sin
+    T0: u32,   // base position
+    H:  u32,   // heads per token (so token = n / H, position = T0 + token)
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
 };
 
 @compute @workgroup_size(64)
@@ -37,15 +42,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = flat % params.D;
     let base = n * params.D;
 
-    // cos/sin rows are (rotary_seq_len, d). We read row T0.
-    let row = params.T0 * params.d;
+    let pos = params.T0 + (n / params.H);
+    let row = pos * params.d;
 
     if (i < params.d) {
-        // First half gets y1 = x1 * cos + x2 * sin
         y[flat] = x[base + i] * cos_t[row + i]
                 + x[base + i + params.d] * sin_t[row + i];
     } else {
-        // Second half gets y2 = -x1 * sin + x2 * cos
         let ii = i - params.d;
         y[flat] = -x[base + ii] * sin_t[row + ii]
                 + x[flat]       * cos_t[row + ii];
