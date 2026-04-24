@@ -20,7 +20,8 @@ import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul, linear,
          initKVCache, destroyKVCache, greedyGenerate,
          forwardT, releaseTensor, _forward_legacy,
          allocTensor, uploadTensor, downloadTensor,
-         softmaxT, beginSession, forwardBatchT } from "./runtime.js";
+         softmaxT, beginSession, forwardBatchT,
+         initDecodeState, writeDecodeState, embeddingStateT } from "./runtime.js";
 import { loadTokenizer, decodeTokens, encodeOrdinary, renderForCompletion } from "./tokenizer.js";
 
 const status = document.getElementById("status");
@@ -303,6 +304,18 @@ const status = document.getElementById("status");
           const dt = performance.now() - t0;
           destroyKVCache(cache);
           return { ms: dt, N, msPerToken: dt / N, legacy: useLegacy };
+        }
+        case "embedding_state": {
+          // Tests the state-aware embedding shader (R2 infra).
+          // Writes token_id to state buffer, dispatches embeddingStateT,
+          // returns the embedding row.
+          const state = initDecodeState(device);
+          writeDecodeState(device, state, { token_id: args.tokenId, T0: 0 });
+          const t = await embeddingStateT(device, model, "transformer.wte.weight", state);
+          const out = await downloadTensor(device, t);
+          releaseTensor(model, t);
+          state.buffer.destroy();
+          return Array.from(out);
         }
         case "forward_batch": {
           // Process T tokens in one prefill call, return last-position logits.

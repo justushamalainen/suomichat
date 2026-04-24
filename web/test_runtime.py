@@ -416,6 +416,23 @@ async def test_greedy_generate(model, prompt_tokens=(100, 7), max_new: int = 8):
     return False
 
 
+async def test_embedding_state(model, token_id: int = 100, atol: float = 1e-5):
+    """State-aware embedding (R2 infra): same result as embeddingT,
+    but token_id read from a separate decode_state uniform buffer."""
+    print(f"--- test: embedding_state token={token_id} ---")
+    import numpy as np
+    ref = ref_embedding(model, token_id).numpy()
+    got = await run_browser_op("embedding_state", {"tokenId": token_id})
+    got = np.array(got, dtype=np.float32)
+    diff = float(np.abs(ref - got).max())
+    print(f"  max abs diff: {diff:.3e} (tol {atol:.0e})")
+    if diff <= atol:
+        print("  ✓ PASS")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_forward_batch(model, prompt_tokens=(100, 7, 42, 200), atol: float = 0.5):
     """Multi-token prefill: forwardBatchT([t0..tN-1]) vs PyTorch model([[t0..tN-1]]).
     Compares last-position logits (which is what we'd sample for the next token).
@@ -837,6 +854,8 @@ async def main():
     passed.append(await test_kv_cache_two_tokens(model, t0=100, t1=7))
     passed.append(await test_kv_cache_two_tokens(model, t0=42, t1=42))  # repeat token edge
     passed.append(await test_forward_batch(model, prompt_tokens=(100, 7, 42, 200)))   # T=4 prefill
+    passed.append(await test_embedding_state(model, token_id=100))
+    passed.append(await test_embedding_state(model, token_id=42))
     passed.append(await test_greedy_generate(model, prompt_tokens=(100, 7), max_new=8))
     passed.append(await test_tokenizer_decode("Moi! Kuka olet?"))
     passed.append(await test_tokenizer_encode("Moi! Kuka olet?"))

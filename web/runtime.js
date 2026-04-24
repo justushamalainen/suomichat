@@ -491,6 +491,89 @@ export async function embeddingBatchT(device, model, weightName, tokenIds) {
   return y;
 }
 
+// ---------------------------------------------------------------------
+// Decode-state uniform buffer (R2). Holds per-token values that need to
+// change between command-buffer replays:
+//   token_id (u32) — current decode token
+//   T0       (u32) — cache.seqlens (= absolute position of this token)
+// Writable via writeDecodeState(...) before each queue.submit.
+// ---------------------------------------------------------------------
+const DECODE_STATE_BYTES = 16;
+
+export function initDecodeState(device) {
+  const buffer = device.createBuffer({
+    label: "decode_state",
+    size: DECODE_STATE_BYTES,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  return { buffer };
+}
+
+export function writeDecodeState(device, state, { token_id = 0, T0 = 0 } = {}) {
+  const ab = new ArrayBuffer(DECODE_STATE_BYTES);
+  const u32 = new Uint32Array(ab);
+  u32[0] = token_id;
+  u32[1] = T0;
+  device.queue.writeBuffer(state.buffer, 0, ab);
+}
+
+// State-aware embedding (reads token_id from state.buffer instead of
+// per-call uniform). Used by the record/replay decode path.
+export async function embeddingStateT(device, model, weightName, state) {
+  const w = model.tensors.get(weightName);
+  if (!w) throw new Error(`embeddingStateT: ${weightName} missing`);
+  const [vocab, dim] = w.shape;
+  const pipeline = await getPipeline(device, model, "embedding_state");
+  const y = allocTensor(device, model, [dim], `${weightName}_state`);
+  // Per-call uniforms: n_embd, vocab (static); state holds token_id.
+  const u = _writeUniforms(device, model, [dim, vocab]);
+  // Manual two-bind-group dispatch (the regular _dispatch helper assumes
+  // a single bind group). We could extend it but keeping things explicit
+  // here documents the layout.
+  if (model.activeSession) {
+    const bg0 = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: w.buffer } },
+        { binding: 1, resource: { buffer: y.buffer } },
+        { binding: 2, resource: { buffer: u } },
+      ],
+    });
+    const bg1 = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(1),
+      entries: [{ binding: 0, resource: { buffer: state.buffer } }],
+    });
+    const pass = model.activeSession._ensurePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bg0);
+    pass.setBindGroup(1, bg1);
+    pass.dispatchWorkgroups(Math.ceil(dim / 64));
+  } else {
+    const bg0 = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: w.buffer } },
+        { binding: 1, resource: { buffer: y.buffer } },
+        { binding: 2, resource: { buffer: u } },
+      ],
+    });
+    const bg1 = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(1),
+      entries: [{ binding: 0, resource: { buffer: state.buffer } }],
+    });
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bg0);
+    pass.setBindGroup(1, bg1);
+    pass.dispatchWorkgroups(Math.ceil(dim / 64));
+    pass.end();
+    device.queue.submit([enc.finish()]);
+  }
+  _releaseUniform(model, u);
+  return y;
+}
+
 // Embedding lookup: a row of `weightName`. Returns Tensor of shape (dim,).
 export async function embeddingT(device, model, weightName, tokenId) {
   const w = model.tensors.get(weightName);
