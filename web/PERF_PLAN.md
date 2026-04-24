@@ -118,6 +118,34 @@ batching collapsed the wrong axis. Remaining axes:
 
 **Acceptance:** 30/30 green; bench tweaks confirm no regression.
 
+### Status (2026-04-24)
+
+| Phase | Status | Result |
+|---|---|---|
+| 1 — bench harness | done | JSON output, baseline 140 ms |
+| 2 — session abstraction | done | no behavior change |
+| 3 — thread session | done | subsumed by Phase 2 |
+| 4 — single-submit forwardT | done | ~1.0x (submit wasn't the bottleneck) |
+| 4b — bind-group cache | done partial | marginal (~5 ms within variance) |
+| 5 — single-session generate | done | subsumed by Phase 4 |
+| 6 — tiled matmul | NOT STARTED | low-impact at d6 (M=1 means no M-tile reuse) |
+| 7 — fp16 weights | NOT STARTED | half memory bandwidth, but dispatch overhead dominates |
+
+**Bottom line**: ~135 ms/token vs 140 baseline. The actual ceiling is
+per-dispatch driver overhead (~0.65 ms × ~200 dispatches). To meaningfully
+beat that you need ONE of:
+
+- **Op fusion** — write a big "transformer block" shader that does
+  attn or mlp in one dispatch. Complex; potential 5–10x.
+- **Multi-token batching** — process 4–8 tokens per forward, reusing
+  the same dispatch overhead. Requires real T>1 attention. ~4x.
+- **Dynamic-offset uniform ring** — collapse the 200 queue.writeBuffer
+  calls into 1. Requires explicit pipeline layouts (every shader
+  needs @group(1) for uniforms). ~2x.
+
+None of these are quick wins; each is a multi-day refactor with its
+own correctness risks. Pausing here for direction.
+
 ### Phase 6 (stretch) — tiled matmul
 - Replace `shaders/matmul.wgsl` and `shaders/linear.wgsl` with a
   workgroup-tile version (8×8 or 16×16 tile, shared memory loads).
