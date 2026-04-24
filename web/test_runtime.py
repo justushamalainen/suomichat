@@ -416,6 +416,34 @@ async def test_greedy_generate(model, prompt_tokens=(100, 7), max_new: int = 8):
     return False
 
 
+async def test_smear_state(model, gate: float = 0.3, seed: int = 0):
+    """Fused smear+snapshot (R4):
+      prev[1] should equal x_input (snapshot)
+      x_output should equal x_input + gate * prev[0]
+    """
+    print(f"--- test: smear_state gate={gate} ---")
+    import numpy as np
+    n_embd = model.config.n_embd
+    g = np.random.default_rng(seed)
+    x_in    = g.standard_normal(n_embd).astype(np.float32)
+    prev0   = g.standard_normal(n_embd).astype(np.float32)
+    expected_x     = x_in + gate * prev0
+    expected_prev1 = x_in.copy()
+    res = await run_browser_op("smear_state", {
+        "x": x_in.tolist(), "prev0": prev0.tolist(), "gate": gate,
+    })
+    got_x     = np.array(res["x"], dtype=np.float32)
+    got_prev1 = np.array(res["prev1"], dtype=np.float32)
+    diff_x     = float(np.abs(got_x - expected_x).max())
+    diff_prev1 = float(np.abs(got_prev1 - expected_prev1).max())
+    print(f"  x diff: {diff_x:.3e}  prev1 (snapshot) diff: {diff_prev1:.3e}")
+    if diff_x < 1e-5 and diff_prev1 < 1e-6:
+        print("  ✓ PASS")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_kv_append_state(kvDim: int = 16, T0: int = 3, maxT: int = 8, seed: int = 0):
     """State-aware KV append (R3): writes src into cache at row T0 via
     the decode_state buffer. Verify cache[T0*kvDim : (T0+1)*kvDim] == src
@@ -884,6 +912,8 @@ async def main():
     passed.append(await test_embedding_state(model, token_id=42))
     passed.append(await test_kv_append_state(kvDim=16, T0=3, maxT=8))
     passed.append(await test_kv_append_state(kvDim=384, T0=5, maxT=16))
+    passed.append(await test_smear_state(model, gate=0.3, seed=0))
+    passed.append(await test_smear_state(model, gate=-0.2, seed=1))
     passed.append(await test_greedy_generate(model, prompt_tokens=(100, 7), max_new=8))
     passed.append(await test_tokenizer_decode("Moi! Kuka olet?"))
     passed.append(await test_tokenizer_encode("Moi! Kuka olet?"))

@@ -22,7 +22,7 @@ import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul, linear,
          allocTensor, uploadTensor, downloadTensor,
          softmaxT, beginSession, forwardBatchT,
          initDecodeState, writeDecodeState, embeddingStateT,
-         kvAppendStateT } from "./runtime.js";
+         kvAppendStateT, ensurePrevPingPong, smearApplyStateT } from "./runtime.js";
 import { loadTokenizer, decodeTokens, encodeOrdinary, renderForCompletion } from "./tokenizer.js";
 
 const status = document.getElementById("status");
@@ -305,6 +305,23 @@ const status = document.getElementById("status");
           const dt = performance.now() - t0;
           destroyKVCache(cache);
           return { ms: dt, N, msPerToken: dt / N, legacy: useLegacy };
+        }
+        case "smear_state": {
+          // Test smearApplyStateT: prev_in=prev[0]=given, prev_out=prev[1] gets
+          // x snapshot, x gets x + gate[0] * prev_in. Then verify both.
+          const n_embd = model.config.n_embd;
+          const cache = initKVCache(device, model, 8);
+          ensurePrevPingPong(device, model, cache);
+          // Override prev[0] with given input
+          device.queue.writeBuffer(cache.prev[0].buffer, 0, new Float32Array(args.prev0));
+          const xT  = uploadTensor(device, model, new Float32Array(args.x), [n_embd], "x");
+          const gT  = uploadTensor(device, model, new Float32Array([args.gate]), [1], "gate");
+          await smearApplyStateT(device, model, gT, xT, cache, 0 /* even parity */);
+          const xOut    = await downloadTensor(device, xT);
+          const prev1   = await downloadTensor(device, cache.prev[1]);
+          releaseTensor(model, xT); releaseTensor(model, gT);
+          destroyKVCache(cache);
+          return { x: Array.from(xOut), prev1: Array.from(prev1) };
         }
         case "kv_append_state": {
           // Tests R3: write src into cache at row T0 via the state buffer.

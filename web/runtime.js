@@ -773,6 +773,11 @@ export function initKVCache(device, model, maxSeqLen) {
     vBuffers: [],
     prevEmbedding: null,    // legacy Float32Array slot (used by old forward())
     prevEmbeddingT: null,   // GPU Tensor slot (used by forwardT)
+    // R4: ping-pong prev for the record/replay decode path. Even-indexed
+    // decode steps read prev[0] and write prev[1]; odd swap. Set during
+    // prefill so the first decode step has a meaningful prev_in.
+    prev:       null,        // [Tensor, Tensor] of shape (n_embd,) when allocated
+    smearStep:  0,           // increments per recorded-replay decode step
   };
   for (let i = 0; i < cfg.n_layer; i++) {
     cache.kBuffers.push(device.createBuffer({
@@ -791,6 +796,43 @@ export function destroyKVCache(cache) {
   for (const b of cache.kBuffers) b.destroy();
   for (const b of cache.vBuffers) b.destroy();
   if (cache.prevEmbeddingT) cache.prevEmbeddingT.buffer.destroy?.();
+  if (cache.prev) for (const t of cache.prev) t?.buffer?.destroy?.();
+}
+
+// Allocate the ping-pong prev[2] buffers on a cache. Called when
+// switching to the record/replay decode path.
+export function ensurePrevPingPong(device, model, cache) {
+  if (cache.prev) return;
+  const n_embd = model.config.n_embd;
+  cache.prev = [
+    allocTensor(device, model, [n_embd], "prev0"),
+    allocTensor(device, model, [n_embd], "prev1"),
+  ];
+  // Initialise to zeros so a first read against the unused slot is harmless.
+  device.queue.writeBuffer(cache.prev[0].buffer, 0, new Float32Array(n_embd));
+  device.queue.writeBuffer(cache.prev[1].buffer, 0, new Float32Array(n_embd));
+  cache.smearStep = 0;
+}
+
+// Apply the fused smear-with-snapshot. Reads prev[readIdx], writes
+// prev[writeIdx], updates x in place.
+export async function smearApplyStateT(device, model, gate, x, cache, parity = null) {
+  if (!cache.prev) throw new Error("smearApplyStateT: ensurePrevPingPong first");
+  const n_embd = model.config.n_embd;
+  const p = parity ?? (cache.smearStep & 1);
+  const readIdx  = p;
+  const writeIdx = 1 - p;
+  const pipeline = await getPipeline(device, model, "smear_apply_state");
+  const u = _writeUniforms(device, model, [n_embd]);
+  const buffers = [
+    gate.buffer,
+    cache.prev[readIdx].buffer,
+    cache.prev[writeIdx].buffer,
+    x.buffer,
+  ];
+  _dispatch(device, model, pipeline, buffers, u, [Math.ceil(n_embd / 64)]);
+  _releaseUniform(model, u);
+  if (parity === null) cache.smearStep += 1;
 }
 
 // ---------------------------------------------------------------------
