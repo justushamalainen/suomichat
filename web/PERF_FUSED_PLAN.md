@@ -40,6 +40,25 @@ function + a test that compares to existing `<name>BlockT` numerically
 - 30/30 still green.
 - Bench drops by the expected savings (within ~30%).
 
+## Status (post-F1)
+
+F1 shader is correct (32/32) but **slower** when wired in. Why:
+
+- Non-fused MLP uses ~12 000 threads across 3 dispatches.
+- Fused single-workgroup MLP uses 256 threads in 1 dispatch.
+- Dispatch savings (~12 ms across 6 layers) are dwarfed by the
+  parallelism loss (~90 ms).
+
+This wall blocks F2/F3/F4 too — single-workgroup fusion always trades
+dispatch overhead for parallelism, and at d6 (small matmuls) the trade
+is bad.
+
+**The actual next direction**: multi-token batching. Process N tokens
+per forwardT (T=4 or T=8) so each dispatch's overhead amortises over
+N tokens of compute. Requires a real T>1 attention path with causal
+mask + KV cache append for N positions at once. Estimated 3-5× wins,
+no parallelism loss. See `web/PERF_BATCH_PLAN.md` (TODO).
+
 ## Verification
 
 After each phase:
