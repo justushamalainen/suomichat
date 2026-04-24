@@ -20,7 +20,8 @@ import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul, linear,
          initKVCache, destroyKVCache, greedyGenerate,
          forwardT, releaseTensor, _forward_legacy,
          allocTensor, uploadTensor, downloadTensor,
-         softmaxT, beginSession, forwardBatchT } from "./runtime.js";
+         softmaxT, beginSession, forwardBatchT,
+         greedyGenerateSpec } from "./runtime.js";
 import { loadTokenizer, decodeTokens, encodeOrdinary, renderForCompletion } from "./tokenizer.js";
 
 const status = document.getElementById("status");
@@ -315,6 +316,46 @@ const status = document.getElementById("status");
           const V = model.config.vocab_size;
           // Return last row only
           return Array.from(all.slice((T - 1) * V, T * V));
+        }
+        case "bench_spec_decode": {
+          // Compare greedyGenerateSpec vs greedyGenerate for the same
+          // prompt+maxNew. Returns wall_ms + accept rate.
+          const promptTokens = args.promptTokens;
+          const maxNew = args.maxNew ?? 32;
+          // Warmup
+          await greedyGenerate(device, model, promptTokens, 4, promptTokens.length + 8);
+          await device.queue.onSubmittedWorkDone();
+          // Plain greedy
+          const tg0 = performance.now();
+          const tokensG = await greedyGenerate(device, model, promptTokens, maxNew, promptTokens.length + maxNew + 4);
+          await device.queue.onSubmittedWorkDone();
+          const ms_greedy = performance.now() - tg0;
+          // Spec
+          const ts0 = performance.now();
+          const r = await greedyGenerateSpec(device, model, promptTokens, maxNew, {
+            draftLen: args.draftLen ?? 4,
+            ngramN:   args.ngramN   ?? 2,
+            maxSeqLen: promptTokens.length + maxNew + 8,
+          });
+          await device.queue.onSubmittedWorkDone();
+          const ms_spec = performance.now() - ts0;
+          return {
+            maxNew,
+            ms_greedy, ms_spec,
+            ms_per_token_greedy: ms_greedy / maxNew,
+            ms_per_token_spec:   ms_spec / maxNew,
+            speedup: ms_greedy / ms_spec,
+            stats: r.stats,
+            tokens_match: JSON.stringify(tokensG) === JSON.stringify(r.tokens),
+          };
+        }
+        case "greedy_generate_spec": {
+          const r = await greedyGenerateSpec(device, model, args.promptTokens, args.maxNew, {
+            draftLen: args.draftLen ?? 4,
+            ngramN:   args.ngramN   ?? 2,
+            maxSeqLen: args.maxSeqLen,
+          });
+          return r;
         }
         case "two_tokens": {
           // Run forward(t0, cache) then forward(t1, cache); return final logits.

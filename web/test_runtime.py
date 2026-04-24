@@ -370,6 +370,45 @@ async def test_chat_e2e(model, prompt_text: str = "Moi! Kuka olet?", max_new: in
     return False
 
 
+async def test_spec_matches_greedy(model, prompt_tokens=(100, 7), max_new: int = 16, draft_len: int = 4, ngram_n: int = 2):
+    """Speculative decoding (PLD) should produce the SAME tokens as
+    plain greedyGenerate because the target model's argmax is what
+    actually gets committed. Any mismatch reveals smear-state drift
+    after a mid-batch reject."""
+    print(f"--- test: spec_matches_greedy prompt={list(prompt_tokens)} max_new={max_new} ---")
+
+    greedy = await run_browser_op("greedy_generate", {
+        "promptTokens": list(prompt_tokens),
+        "maxNew": max_new,
+        "maxSeqLen": len(prompt_tokens) + max_new + 2,
+    })
+    spec = await run_browser_op("greedy_generate_spec", {
+        "promptTokens": list(prompt_tokens),
+        "maxNew": max_new,
+        "draftLen": draft_len,
+        "ngramN": ngram_n,
+        "maxSeqLen": len(prompt_tokens) + max_new + 8,
+    })
+    spec_tokens = spec["tokens"]
+    stats = spec["stats"]
+    match = greedy == spec_tokens
+    print(f"  greedy: {greedy}")
+    print(f"  spec:   {spec_tokens}")
+    print(f"  stats: attempts={stats['spec_attempts']} drafts={stats['spec_drafts']} "
+          f"accepted={stats['spec_accepted']} plain_forwards={stats['plain_forwards']}")
+    if match:
+        print("  ✓ PASS (tokens match greedy)")
+        return True
+    # Quantify mismatch
+    n_match = 0
+    for a, b in zip(greedy, spec_tokens):
+        if a == b: n_match += 1
+        else: break
+    print(f"  ! diverges at position {n_match}/{len(greedy)}")
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_greedy_generate(model, prompt_tokens=(100, 7), max_new: int = 8):
     """Greedy autoregressive generation. Compares the WebGPU output token
     sequence against PyTorch ref (forward + argmax loop).
@@ -838,6 +877,16 @@ async def main():
     passed.append(await test_kv_cache_two_tokens(model, t0=42, t1=42))  # repeat token edge
     passed.append(await test_forward_batch(model, prompt_tokens=(100, 7, 42, 200)))   # T=4 prefill
     passed.append(await test_greedy_generate(model, prompt_tokens=(100, 7), max_new=8))
+    passed.append(await test_spec_matches_greedy(model, prompt_tokens=(100, 7), max_new=16))
+    passed.append(await test_spec_matches_greedy(model, prompt_tokens=(100, 7, 100, 7, 100, 7), max_new=16))   # repetitive pattern → should hit PLD
+    # Real chat prompt — this is where the smear-state drift bites.
+    from suomichat.tokenizer import get_tokenizer
+    _tok = get_tokenizer()
+    _p = _tok.render_for_completion({"messages": [
+        {"role": "user", "content": "Kerro vitsi, sitten toinen, sitten kolmas."},
+        {"role": "assistant", "content": ""},
+    ]})
+    passed.append(await test_spec_matches_greedy(model, prompt_tokens=_p, max_new=32))
     passed.append(await test_tokenizer_decode("Moi! Kuka olet?"))
     passed.append(await test_tokenizer_encode("Moi! Kuka olet?"))
     passed.append(await test_tokenizer_encode("hei maailma"))
@@ -849,6 +898,25 @@ async def main():
     print("--- bench ---")
     summary = await run_bench(args.bench_n, 100)
     print(json.dumps(summary, indent=2))
+
+    print("--- bench: speculative decode (PLD) vs plain greedy ---")
+    # Use a prompt that exercises repeated n-grams (chat_e2e output includes
+    # repetitions that trigger PLD matches).
+    from suomichat.tokenizer import get_tokenizer
+    tok = get_tokenizer()
+    conv = {"messages": [
+        {"role": "user", "content": "Kerro vitsi, sitten toinen, sitten kolmas."},
+        {"role": "assistant", "content": ""},
+    ]}
+    prompt_ids = tok.render_for_completion(conv)
+    spec_bench = await run_browser_op("bench_spec_decode", {
+        "promptTokens": prompt_ids, "maxNew": 32, "draftLen": 4, "ngramN": 2,
+    })
+    print(json.dumps(spec_bench, indent=2))
+    if spec_bench.get("tokens_match"):
+        acc = spec_bench["stats"]["spec_accepted"] / max(1, spec_bench["stats"]["spec_drafts"])
+        print(f"  accept rate: {acc:.1%}  ({spec_bench['stats']['spec_accepted']}/{spec_bench['stats']['spec_drafts']})")
+        print(f"  speedup: {spec_bench['speedup']:.2f}x")
 
     print("--- bench: prefill batched vs stepwise ---")
     prefill = await run_browser_op("bench_prefill", {"N": 8, "iters": 10})
