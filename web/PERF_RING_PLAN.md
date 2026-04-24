@@ -76,6 +76,50 @@ the bind groups stay valid forever — no rebuild per forward.
   via per-call uniform — fine, just one of the 18 dynamic uniforms
   per forward).
 
+## Status update (post-C5): no speedup
+
+C1-C4 all landed correctly. 41/41 tests still green. The ring buffer
+collapses ~180 per-dispatch writeBuffer calls into one writeBuffer per
+session at submit time.
+
+Bench (RTX 6000 Ada, d6 SFT, N=100, three runs):
+  forwardT_ms_per_token: 122, 135, 145 ms   (~10% variance)
+  baseline_ms_per_token: 140 ms
+
+Net effect on decode: indistinguishable from baseline. The estimated
+~36 ms savings from collapsed writeBuffers did not materialise.
+
+Hypothesis: in Chromium 2026 / Vulkan, `device.queue.writeBuffer` for
+small (16-byte) uniforms is much cheaper than I assumed (probably
+batched/coalesced internally by the driver). The ~0.2 ms per
+writeBuffer figure I reasoned from is wrong.
+
+Other observations:
+- The infrastructure (ring, shared bind-group layout, explicit
+  pipeline layouts, getRingPipeline, _stageUniforms, _dispatchRing)
+  is sound and reusable. Future opt that wants dynamic-offset
+  uniforms can build on it.
+- 41/41 correctness tests still pass, including the perf-sensitive
+  e2e tests. The migration is correct, just doesn't move the needle
+  at this model scale on this driver.
+
+What's left as the actual decode bottleneck:
+- Per-dispatch GPU compute time (lm_head matmul ~5-10 ms is the worst)
+- Per-dispatch pipeline+bind-group setup at the driver level
+  (~0.5-0.6 ms × 180 dispatches)
+- The fundamental WebGPU per-dispatch overhead that PyTorch CUDA
+  doesn't pay (~0.4 ms vs ~5 µs)
+
+Closing the remaining gap likely requires either:
+- A different runtime entirely (e.g., emscripten + manual Vulkan)
+- Multi-token batching for decode (speculative decoding) — speculative
+  draft model proposes K tokens, verify with one forwardBatchT call
+- Op fusion via tiled matmul (NOT the single-workgroup fusion that
+  failed at d6 — would need multi-workgroup tiling that preserves
+  parallelism)
+
+C5 marked BLOCKED on the perf gate but COMPLETE on correctness.
+
 ## Acceptance per phase
 
 C1: 41/41 green (no behavior change).
