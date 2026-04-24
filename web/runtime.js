@@ -211,6 +211,45 @@ export function releaseTensor(model, t) {
 export const POOL_DEBUG_NO_RELEASE = false;
 
 // ---------------------------------------------------------------------
+// 4d-bis. Bind-group cache.
+//
+// createBindGroup is ~0.2 ms in Chromium (validation overhead). With
+// 310 dispatches per forward, that's ~62 ms wasted on bind-group
+// objects we already built last forward. Buffers come from the pool
+// → identical GPUBuffer objects across forwards → identical bind
+// groups → cacheable.
+//
+// Key: concatenated buffer ids (each buffer gets a stable id via
+// WeakMap on first sight) + pipeline label.
+// ---------------------------------------------------------------------
+const _bufferIds = new WeakMap();
+let _nextBufferId = 0;
+function _bufferId(buf) {
+  let id = _bufferIds.get(buf);
+  if (id === undefined) { id = _nextBufferId++; _bufferIds.set(buf, id); }
+  return id;
+}
+
+function _bindGroupKey(pipeline, buffers, uniformsBuf) {
+  let k = pipeline.label || "?";
+  for (const b of buffers) k += "/" + _bufferId(b);
+  if (uniformsBuf) k += "u" + _bufferId(uniformsBuf);
+  return k;
+}
+
+function _getBindGroup(device, model, pipeline, bufferBindings, uniformsBuf) {
+  if (!model.bindGroupCache) model.bindGroupCache = new Map();
+  const key = _bindGroupKey(pipeline, bufferBindings, uniformsBuf);
+  let bg = model.bindGroupCache.get(key);
+  if (bg) return bg;
+  const entries = bufferBindings.map((b, i) => ({ binding: i, resource: { buffer: b } }));
+  if (uniformsBuf) entries.push({ binding: bufferBindings.length, resource: { buffer: uniformsBuf } });
+  bg = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
+  model.bindGroupCache.set(key, bg);
+  return bg;
+}
+
+// ---------------------------------------------------------------------
 // 4e. Session: a single command encoder + lazy compute pass that
 // accumulates many dispatches and submits ONCE.
 //
@@ -249,9 +288,7 @@ export function beginSession(device, model) {
     },
 
     dispatch(pipeline, bufferBindings, uniformsBuf, dim) {
-      const entries = bufferBindings.map((b, i) => ({ binding: i, resource: { buffer: b } }));
-      if (uniformsBuf) entries.push({ binding: bufferBindings.length, resource: { buffer: uniformsBuf } });
-      const bg = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
+      const bg = _getBindGroup(device, model, pipeline, bufferBindings, uniformsBuf);
       const pass = this._ensurePass();
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, bg);
@@ -339,9 +376,7 @@ function _dispatch(device, model, pipeline, bufferBindings, uniformsBuf, dispatc
     model.activeSession.dispatch(pipeline, bufferBindings, uniformsBuf, dispatch);
     return;
   }
-  const entries = bufferBindings.map((b, i) => ({ binding: i, resource: { buffer: b } }));
-  if (uniformsBuf) entries.push({ binding: bufferBindings.length, resource: { buffer: uniformsBuf } });
-  const bg = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
+  const bg = _getBindGroup(device, model, pipeline, bufferBindings, uniformsBuf);
   const enc = device.createCommandEncoder();
   const pass = enc.beginComputePass();
   pass.setPipeline(pipeline);
