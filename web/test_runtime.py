@@ -81,6 +81,9 @@ def ref_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 CHROMIUM_FLAGS = [
     # WebGPU is gated behind these flags in 2026-04 Chromium builds.
     "--enable-unsafe-webgpu",
+    # Needed for timestamp-query feature at full nanosecond resolution
+    # (default Chromium quantises timestamps to 100 µs).
+    "--enable-webgpu-developer-features",
     "--enable-features=Vulkan",
     "--use-vulkan",
     "--enable-features=VulkanFromANGLE",
@@ -793,6 +796,8 @@ async def main():
     ap.add_argument("--base-url", default="http://localhost:9876")
     ap.add_argument("--bench-only", action="store_true",
                     help="Skip correctness tests; just run the bench and print JSON.")
+    ap.add_argument("--profile", action="store_true",
+                    help="GPU-side per-dispatch profile via timestamp-query; prints histogram.")
     ap.add_argument("--bench-n", type=int, default=50,
                     help="Iterations per bench run (default 50).")
     args = ap.parse_args()
@@ -801,6 +806,23 @@ async def main():
     model, tokenizer, meta = load_model(
         args.source, device=torch.device("cpu"), phase="eval", model_tag=args.model_tag,
     )
+
+    if getattr(args, "profile", False):
+        # Need a model load to populate the page first
+        await test_embedding(model, args.token_id)
+        print("\n--- GPU profile (N=20 decode forwards) ---")
+        rep = await run_browser_op("bench_profile", {"tokenId": args.token_id, "N": 20})
+        print(f"wall:        {rep['wall_ms_per_token']:.2f} ms/token   ({rep['wall_ms']:.0f} ms total / {rep['N']} iters)")
+        print(f"gpu-active:  {rep['gpu_total_ms_per_token']:.2f} ms/token   (sum of per-dispatch GPU time)")
+        print(f"dispatches:  {rep['dispatches_per_token']:.0f} per token")
+        print(f"gpu-idle:    {rep['wall_ms_per_token'] - rep['gpu_total_ms_per_token']:.2f} ms/token   (wall - gpu-active)\n")
+        rows = sorted(rep["histogram"].items(), key=lambda kv: -kv[1]["total_ms"])
+        n_tok = rep["N"]
+        print(f"{'shader':<22} {'calls':>8} {'total_ms':>12} {'ms/call':>10} {'ms/tok':>10}")
+        print("-" * 66)
+        for shader, h in rows:
+            print(f"{shader:<22} {h['count']:>8} {h['total_ms']:>12.2f} {h['avg_ms']:>10.3f} {h['total_ms']/n_tok:>10.3f}")
+        sys.exit(0)
 
     if args.bench_only:
         # Need a model load to populate the page first — call any cheap op.
