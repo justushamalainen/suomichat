@@ -468,6 +468,29 @@ export async function softmaxT(device, model, x, rows, n) {
   return y;
 }
 
+// Multi-token embedding: returns Tensor of shape (T, dim).
+export async function embeddingBatchT(device, model, weightName, tokenIds) {
+  const w = model.tensors.get(weightName);
+  if (!w) throw new Error(`embeddingBatchT: ${weightName} missing`);
+  const [vocab, dim] = w.shape;
+  const T = tokenIds.length;
+  const pipeline = await getPipeline(device, model, "embedding_batch");
+  // Upload token IDs as u32 buffer (also via pool)
+  const idBytes = T * 4;
+  const idBuf = _ensurePool(model).acquire(device, Math.max(idBytes, 16),
+                  GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+                  "tokenIds");
+  device.queue.writeBuffer(idBuf, 0, new Uint32Array(tokenIds));
+  const y = allocTensor(device, model, [T, dim], `${weightName}_batch`);
+  const u = _writeUniforms(device, model, [T, dim, vocab]);
+  _dispatch(device, model, pipeline, [w.buffer, idBuf, y.buffer], u,
+            [Math.ceil(T * dim / 64)]);
+  _releaseUniform(model, u);
+  if (model.activeSession) model.activeSession.deferRelease(idBuf);
+  else _ensurePool(model).release(idBuf);
+  return y;
+}
+
 // Embedding lookup: a row of `weightName`. Returns Tensor of shape (dim,).
 export async function embeddingT(device, model, weightName, tokenId) {
   const w = model.tensors.get(weightName);
@@ -486,15 +509,17 @@ export async function linearT(device, model, x, weightName) {
   if (!w) throw new Error(`linearT: ${weightName} missing`);
   const [N, K] = w.shape;
   const M = x.shape.length === 1 ? 1 : x.shape[0];
-  // We allow x's last-dim to be ≥ K — the linear shader indexes x[m*K + k]
-  // and reads only the first K elements per row. ve_gate / smear_gate use
-  // this to consume a prefix of n_embd without an explicit slice.
-  if (x.shape[x.shape.length - 1] < K) {
-    throw new Error(`linearT: x last-dim ${x.shape[x.shape.length - 1]} < weight K=${K}`);
+  const xLastDim = x.shape[x.shape.length - 1];
+  if (xLastDim < K) {
+    throw new Error(`linearT: x last-dim ${xLastDim} < weight K=${K}`);
   }
+  // For T>1 with K < xLastDim, must pass row stride = xLastDim so the
+  // shader skips correctly between rows. For K = xLastDim (the common
+  // case), Kstride = K = xLastDim.
+  const Kstride = xLastDim;
   const pipeline = await getPipeline(device, model, "linear");
   const y = allocTensor(device, model, [M, N], "linear_y");
-  const u = _writeUniforms(device, model, [M, K, N, 0]);
+  const u = _writeUniforms(device, model, [M, K, N, Kstride]);
   _dispatch(device, model, pipeline, [x.buffer, w.buffer, y.buffer], u,
             [Math.ceil(M / 8), Math.ceil(N / 8)]);
   _releaseUniform(model, u);
@@ -996,6 +1021,121 @@ export async function forwardT(device, model, tokenId, cache = null) {
 }
 
 // ---------------------------------------------------------------------
+// forwardBatchT — process T tokens in one forward pass. Used for
+// prefill (T>1). Single token (T=1) decode should still use forwardT
+// for clarity (this path also works for T=1 but is less optimised).
+//
+// Returns logits Tensor of shape (T, vocab_size). Caller takes the
+// last position (shape [vocab_size,]) to sample the next token.
+// ---------------------------------------------------------------------
+export async function forwardBatchT(device, model, tokenIds, cache = null) {
+  const T = tokenIds.length;
+  if (T === 0) throw new Error("forwardBatchT: empty");
+  const cfg = model.config;
+  const n_layer = cfg.n_layer;
+  const n_embd  = cfg.n_embd;
+  const T0 = cache ? cache.seqlens : 0;
+
+  await _preloadScalars(device, model);
+  // Pre-fetch all pipelines (same as forwardT + the new batch ones)
+  await getPipeline(device, model, "embedding_batch");
+  await getPipeline(device, model, "embedding");
+  await getPipeline(device, model, "rmsnorm");
+  await getPipeline(device, model, "linear");
+  await getPipeline(device, model, "rope");
+  await getPipeline(device, model, "scalar_mul");
+  await getPipeline(device, model, "add");
+  await getPipeline(device, model, "mul");
+  await getPipeline(device, model, "relu2");
+  await getPipeline(device, model, "sigmoid");
+  await getPipeline(device, model, "softcap");
+  await getPipeline(device, model, "softmax");
+  await getPipeline(device, model, "ve_apply_t");
+  await getPipeline(device, model, "smear_apply_t");
+  await getPipeline(device, model, "smear_apply");
+  await getPipeline(device, model, "sdpa_scores");
+  await getPipeline(device, model, "sdpa_output");
+
+  const sess = beginSession(device, model);
+
+  // 1. Embedding (T tokens at once) + per-row rmsnorm
+  const xEmbed = await embeddingBatchT(device, model, "transformer.wte.weight", tokenIds);
+  let x = await rmsnormT(device, model, xEmbed); releaseTensor(model, xEmbed);
+  // x is (T, n_embd) post-norm pre-smear
+
+  // 2. Snapshot LAST position into cache.prevEmbeddingT so the next
+  //    forwardT (decode) sees this batch's last embedding as `prev`.
+  if (cache) {
+    if (cache.prevEmbeddingT) releaseTensor(model, cache.prevEmbeddingT);
+    const lastRow = allocTensor(device, model, [1, n_embd], "prev_embed_snap");
+    _copyBuffer(device, model, x.buffer, (T - 1) * n_embd * 4, lastRow.buffer, 0, n_embd * 4);
+    cache.prevEmbeddingT = lastRow;
+  }
+
+  // 3. Smear (only positions 1..T-1 within this batch). PyTorch (gpt.py:438):
+  //    gate = smear_lambda * sigmoid(smear_gate(x[:, 1:, :24]))
+  //    x[:, 1:] = x[:, 1:] + gate * x[:, :-1]
+  //    For T==1 there's no within-batch smear. The cross-batch smear
+  //    (using cache.prevEmbeddingT from a previous call) only fires in
+  //    the per-token forwardT path; here we ignore it (T=1 should use
+  //    forwardT). For T>=2 we apply the within-batch smear.
+  if (T >= 2) {
+    const gateRaw    = await linearT  (device, model, x, "smear_gate.weight");          // (T, 1)
+    const gateSig    = await sigmoidT (device, model, gateRaw); releaseTensor(model, gateRaw);
+    const gateScaled = await scalarMulT(device, model, gateSig, model.smearLambda); releaseTensor(model, gateSig);
+    const xSmeared = allocTensor(device, model, [T, n_embd], "smeared");
+    {
+      const pipeline = await getPipeline(device, model, "smear_apply_t");
+      const u = _writeUniforms(device, model, [T, n_embd]);
+      _dispatch(device, model, pipeline, [gateScaled.buffer, x.buffer, xSmeared.buffer], u,
+                [Math.ceil(T * n_embd / 64)]);
+      _releaseUniform(model, u);
+    }
+    releaseTensor(model, gateScaled);
+    releaseTensor(model, x);
+    x = xSmeared;
+  }
+
+  // 4. x0 baseline = post-smear normalized embedding
+  const x0 = copyTensor(device, model, x);
+
+  // 5. Transformer blocks
+  const backoutIdx = Math.floor(n_layer / 2);
+  let xBackout = null;
+  for (let i = 0; i < n_layer; i++) {
+    let ve = null;
+    const veName = `value_embeds.${i}.weight`;
+    if (model.tensors.has(veName)) {
+      ve = await embeddingBatchT(device, model, veName, tokenIds);   // (T, kvDim)
+    }
+    const next = await transformerBlockBatchT(device, model, i, x, x0, T, T0, ve, cache);
+    if (ve) releaseTensor(model, ve);
+    releaseTensor(model, x);
+    x = next;
+    if (i === backoutIdx) xBackout = copyTensor(device, model, x);
+  }
+  releaseTensor(model, x0);
+
+  if (cache) cache.seqlens += T;
+
+  // 6. Backout
+  if (xBackout !== null) {
+    const negScaled = await scalarMulT(device, model, xBackout, -model.backoutLambda);
+    releaseTensor(model, xBackout);
+    const newX = await addT(device, model, x, negScaled); releaseTensor(model, negScaled);
+    releaseTensor(model, x); x = newX;
+  }
+
+  // 7. Final norm + lm_head + softcap (per row)
+  const xN = await rmsnormT(device, model, x); releaseTensor(model, x);
+  const logitsPadded = await linearT(device, model, xN, "lm_head.weight"); releaseTensor(model, xN);
+  const logitsCapped = await softcapT(device, model, logitsPadded, 15.0); releaseTensor(model, logitsPadded);
+
+  await sess.submit();
+  return logitsCapped;   // shape (T, vocab)
+}
+
+// ---------------------------------------------------------------------
 // Greedy generation: prefill prompt, then sample argmax `maxNew` times.
 // Returns full token sequence (prompt + generated). Temperature 0.
 //
@@ -1069,6 +1209,115 @@ async function ensureScalars(device, model) {
 //   x = resid_lambdas[i]*x + x0_lambdas[i]*x0
 //   x = x + attn(norm(x))
 //   x = x + mlp(norm(x))
+// ---------------------------------------------------------------------
+// Multi-token attention block (T>1). Mirrors attentionBlockT but with
+// T queries per call. Used by forwardBatchT for prefill.
+// ---------------------------------------------------------------------
+export async function attentionBlockBatchT(device, model, layerIdx, x, T, T0, ve, cache) {
+  const prefix = `transformer.h.${layerIdx}.attn`;
+  const cfg = model.config;
+  const n_head   = cfg.n_head;
+  const n_kv     = cfg.n_kv_head;
+  const head_dim = cfg.n_embd / n_head;
+  const kvDim    = n_kv * head_dim;
+
+  // Q, K, V for T tokens
+  const q = await linearT(device, model, x, `${prefix}.c_q.weight`);   // (T, n_embd)
+  const k = await linearT(device, model, x, `${prefix}.c_k.weight`);   // (T, kvDim)
+  let   v = await linearT(device, model, x, `${prefix}.c_v.weight`);   // (T, kvDim)
+
+  // VE gate per (token, head)
+  if (ve !== null) {
+    const gateRaw    = await linearT  (device, model, x, `${prefix}.ve_gate.weight`);   // (T, n_kv)
+    const gateSig    = await sigmoidT (device, model, gateRaw); releaseTensor(model, gateRaw);
+    const gateTriple = await scalarMulT(device, model, gateSig, 3.0); releaseTensor(model, gateSig);
+    // ve_apply_t: v[t, h, d] += gate[t, h] * ve[t, h, d]
+    {
+      const numel = T * kvDim;
+      const pipeline = await getPipeline(device, model, "ve_apply_t");
+      const u = _writeUniforms(device, model, [numel, head_dim, n_kv]);
+      _dispatch(device, model, pipeline, [gateTriple.buffer, ve.buffer, v.buffer], u, [Math.ceil(numel / 64)]);
+      _releaseUniform(model, u);
+    }
+    releaseTensor(model, gateTriple);
+  }
+
+  // RoPE: per-token positions (T0..T0+T-1)
+  const qR = await ropeApplyT(device, model, q, T0, head_dim, n_head); releaseTensor(model, q);
+  const kR = await ropeApplyT(device, model, k, T0, head_dim, n_kv);   releaseTensor(model, k);
+
+  // Per-(token, head) QK rmsnorm
+  const qN = await rmsnormT(device, model, qR, 1e-5, T * n_head, head_dim); releaseTensor(model, qR);
+  const kN = await rmsnormT(device, model, kR, 1e-5, T * n_kv,   head_dim); releaseTensor(model, kR);
+
+  // Scale 1.2
+  const qS = await scalarMulT(device, model, qN, 1.2); releaseTensor(model, qN);
+  const kS = await scalarMulT(device, model, kN, 1.2); releaseTensor(model, kN);
+
+  // Cache append: write T entries starting at offset T0
+  const writeOffset = T0 * kvDim * 4;
+  _copyBuffer(device, model, kS.buffer, 0, cache.kBuffers[layerIdx], writeOffset, T * kvDim * 4);
+  _copyBuffer(device, model, v.buffer,  0, cache.vBuffers[layerIdx], writeOffset, T * kvDim * 4);
+  const Tk = T0 + T;
+
+  // SDPA T queries × Tk keys (causal)
+  const scoresT = allocTensor(device, model, [T, n_head, Tk], "sdpa_scores_batch");
+  {
+    const pipeline = await getPipeline(device, model, "sdpa_scores");
+    const u = _writeUniforms(device, model,
+      [n_head, n_kv, head_dim, Tk, T, T0],
+      [[24, 1.0 / Math.sqrt(head_dim)]]);
+    _dispatch(device, model, pipeline,
+      [qS.buffer, cache.kBuffers[layerIdx], scoresT.buffer],
+      u, [Math.ceil(T * n_head / 8), Math.ceil(Tk / 8)]);
+    _releaseUniform(model, u);
+  }
+  const attnW = await softmaxT(device, model, scoresT, T * n_head, Tk);
+  releaseTensor(model, scoresT);
+  const attnT = allocTensor(device, model, [T, n_head * head_dim], "sdpa_out_batch");
+  {
+    const pipeline = await getPipeline(device, model, "sdpa_output");
+    const u = _writeUniforms(device, model, [n_head, n_kv, head_dim, Tk, T]);
+    _dispatch(device, model, pipeline,
+      [attnW.buffer, cache.vBuffers[layerIdx], attnT.buffer],
+      u, [Math.ceil(T * n_head / 8), Math.ceil(head_dim / 8)]);
+    _releaseUniform(model, u);
+  }
+  releaseTensor(model, attnW);
+  releaseTensor(model, v);
+  releaseTensor(model, kS);
+
+  const out = await linearT(device, model, attnT, `${prefix}.c_proj.weight`);
+  releaseTensor(model, attnT);
+  return out;
+}
+
+// Multi-token transformer block (T>1).
+export async function transformerBlockBatchT(device, model, layerIdx, x, x0, T, T0, ve, cache) {
+  await ensureScalars(device, model);
+  const residL = model.residLambdas[layerIdx];
+  const x0L    = model.x0Lambdas[layerIdx];
+
+  const resid = await scalarMulT(device, model, x,  residL);
+  const x0m   = await scalarMulT(device, model, x0, x0L);
+  let   cur   = await addT       (device, model, resid, x0m);
+  releaseTensor(model, resid); releaseTensor(model, x0m);
+
+  const xn = await rmsnormT(device, model, cur);
+  const ao = await attentionBlockBatchT(device, model, layerIdx, xn, T, T0, ve, cache);
+  releaseTensor(model, xn);
+  const cur2 = await addT(device, model, cur, ao);
+  releaseTensor(model, cur); releaseTensor(model, ao);
+  cur = cur2;
+
+  const xn2 = await rmsnormT(device, model, cur);
+  const mo  = await mlpBlockT(device, model, layerIdx, xn2);
+  releaseTensor(model, xn2);
+  const cur3 = await addT(device, model, cur, mo);
+  releaseTensor(model, cur); releaseTensor(model, mo);
+  return cur3;
+}
+
 export async function transformerBlockT(device, model, layerIdx, x, x0, T0 = 0, ve = null, cache = null) {
   await ensureScalars(device, model);
   const residL = model.residLambdas[layerIdx];

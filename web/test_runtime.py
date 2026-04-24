@@ -416,6 +416,33 @@ async def test_greedy_generate(model, prompt_tokens=(100, 7), max_new: int = 8):
     return False
 
 
+async def test_forward_batch(model, prompt_tokens=(100, 7, 42, 200), atol: float = 0.5):
+    """Multi-token prefill: forwardBatchT([t0..tN-1]) vs PyTorch model([[t0..tN-1]]).
+    Compares last-position logits (which is what we'd sample for the next token).
+    Acceptance: argmax matches + abs diff under tol."""
+    print(f"--- test: forward_batch tokens={list(prompt_tokens)} ---")
+    import numpy as np
+    tokens = torch.tensor([list(prompt_tokens)])
+    with torch.no_grad():
+        ref_logits = model(tokens).cpu().float().numpy()
+    ref = ref_logits[0, -1]   # last position
+    got = await run_browser_op("forward_batch", {"tokenIds": list(prompt_tokens)})
+    got = np.array(got, dtype=np.float32)
+    diff = float(np.abs(ref - got).max())
+    rel  = diff / (float(np.abs(ref).max()) + 1e-12)
+    ref_top3 = ref.argsort()[-3:][::-1].tolist()
+    got_top3 = got.argsort()[-3:][::-1].tolist()
+    print(f"  max abs diff: {diff:.3e}  rel: {rel:.3e}  (tol {atol:.2f})")
+    print(f"  argmax — ref: {int(ref.argmax())}  got: {int(got.argmax())}  {'MATCH' if ref.argmax()==got.argmax() else 'MISMATCH'}")
+    print(f"  top-3 ref: {ref_top3}  got: {got_top3}")
+    ok = (diff <= atol) and (int(ref.argmax()) == int(got.argmax()))
+    if ok:
+        print("  ✓ PASS")
+        return True
+    print("  ✗ FAIL")
+    return False
+
+
 async def test_kv_cache_two_tokens(model, t0: int = 100, t1: int = 7, atol: float = 0.5):
     """Two-step decode with KV cache + smear gate (smear fires on step 2).
     Compares the WebGPU position-1 logits to PyTorch's logits[0, 1]
@@ -809,6 +836,7 @@ async def main():
     passed.append(await test_softmax(seed=1, rows=6, n=1))    # trivial 1-element softmax = 1.0
     passed.append(await test_kv_cache_two_tokens(model, t0=100, t1=7))
     passed.append(await test_kv_cache_two_tokens(model, t0=42, t1=42))  # repeat token edge
+    passed.append(await test_forward_batch(model, prompt_tokens=(100, 7, 42, 200)))   # T=4 prefill
     passed.append(await test_greedy_generate(model, prompt_tokens=(100, 7), max_new=8))
     passed.append(await test_tokenizer_decode("Moi! Kuka olet?"))
     passed.append(await test_tokenizer_encode("Moi! Kuka olet?"))

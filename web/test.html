@@ -20,7 +20,7 @@ import { initWebGPU, loadModel, embeddingLookup, rmsnorm, matmul, linear,
          initKVCache, destroyKVCache, greedyGenerate,
          forwardT, releaseTensor, _forward_legacy,
          allocTensor, uploadTensor, downloadTensor,
-         softmaxT, beginSession } from "./runtime.js";
+         softmaxT, beginSession, forwardBatchT } from "./runtime.js";
 import { loadTokenizer, decodeTokens, encodeOrdinary, renderForCompletion } from "./tokenizer.js";
 
 const status = document.getElementById("status");
@@ -261,6 +261,18 @@ const status = document.getElementById("status");
           const dt = performance.now() - t0;
           destroyKVCache(cache);
           return { ms: dt, N, msPerToken: dt / N, legacy: useLegacy };
+        }
+        case "forward_batch": {
+          // Process T tokens in one prefill call, return last-position logits.
+          const cache = initKVCache(device, model, args.tokenIds.length + 4);
+          const logitsT = await forwardBatchT(device, model, args.tokenIds, cache);
+          const all = await downloadTensor(device, logitsT);
+          releaseTensor(model, logitsT);
+          destroyKVCache(cache);
+          const T = args.tokenIds.length;
+          const V = model.config.vocab_size;
+          // Return last row only
+          return Array.from(all.slice((T - 1) * V, T * V));
         }
         case "two_tokens": {
           // Run forward(t0, cache) then forward(t1, cache); return final logits.

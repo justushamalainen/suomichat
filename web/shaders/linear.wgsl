@@ -1,16 +1,13 @@
 // Linear layer without bias: y = x @ weight.T
 //
-// Matches torch.nn.Linear(in_features, out_features, bias=False) where
-// weight has PyTorch's native shape (out_features, in_features).
-//
 // Shapes:
-//   x:      (M, K)       row-major
-//   weight: (N, K)       row-major (PyTorch convention)
+//   x:      (M, Kstride)   row-major; we use only the FIRST K elements per row
+//   weight: (N, K)         row-major (PyTorch convention)
 //   y:      (M, N)
 //
-// We avoid needing a separate matmul shader for weights by indexing
-// weight[n, k] at offset (n * K + k) — i.e. reading "along" the
-// out-feature dimension, which is equivalent to (x @ weight.T).
+// `Kstride` defaults to K (set by JS) — backwards-compatible. When the
+// caller wants to consume only a prefix of a wider row (e.g. ve_gate
+// reads x[..., :12] from x of shape (T, n_embd)), pass Kstride=n_embd.
 
 @group(0) @binding(0) var<storage, read>       x:      array<f32>;
 @group(0) @binding(1) var<storage, read>       w:      array<f32>;
@@ -18,10 +15,10 @@
 @group(0) @binding(3) var<uniform>             params: Params;
 
 struct Params {
-    M:   u32,   // rows of x
-    K:   u32,   // in_features
-    N:   u32,   // out_features
-    _p:  u32,
+    M:        u32,
+    K:        u32,
+    N:        u32,
+    Kstride:  u32,
 };
 
 @compute @workgroup_size(8, 8)
@@ -35,7 +32,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var k: u32 = 0u;
     loop {
         if (k >= params.K) { break; }
-        s = s + x[m * params.K + k] * w[n * params.K + k];
+        s = s + x[m * params.Kstride + k] * w[n * params.K + k];
         k = k + 1u;
     }
     y[m * params.N + n] = s;
