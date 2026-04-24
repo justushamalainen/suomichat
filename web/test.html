@@ -125,9 +125,9 @@ const status = document.getElementById("status");
           const outBuf = device.createBuffer({ size: T*nH*hd*4,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
 
-          // sdpa_scores uniforms: nH, nKV, hd, Tk, T, T0=0, scale@24
+          // sdpa_scores uniforms: nH, nKV, hd, Tk, T, T0=0, scale@24, Tk_valid=Tk
           const ub1 = new ArrayBuffer(32);
-          new Uint32Array(ub1).set([nH, nKV, hd, Tk, T, 0]);
+          new Uint32Array(ub1).set([nH, nKV, hd, Tk, T, 0, /*scale slot*/0, Tk]);
           new DataView(ub1).setFloat32(24, 1.0/Math.sqrt(hd), true);
           const u1 = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
           device.queue.writeBuffer(u1, 0, ub1);
@@ -152,9 +152,9 @@ const status = document.getElementById("status");
           const scoresTensor = { buffer: scoresBuf, byteLength: T*nH*Tk*4, _pooled: false, shape: [T*nH, Tk] };
           const attnT = await softmaxT(device, model, scoresTensor, T*nH, Tk);
 
-          // sdpa_output uniforms: nH, nKV, hd, Tk, T
+          // sdpa_output uniforms: nH, nKV, hd, Tk, T, Tk_valid=Tk
           const ub2 = new ArrayBuffer(32);
-          new Uint32Array(ub2).set([nH, nKV, hd, Tk, T]);
+          new Uint32Array(ub2).set([nH, nKV, hd, Tk, T, Tk]);
           const u2 = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
           device.queue.writeBuffer(u2, 0, ub2);
 

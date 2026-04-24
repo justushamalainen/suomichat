@@ -1271,12 +1271,14 @@ export async function attentionBlockBatchT(device, model, layerIdx, x, T, T0, ve
   _copyBuffer(device, model, v.buffer,  0, cache.vBuffers[layerIdx], writeOffset, T * kvDim * 4);
   const Tk = T0 + T;
 
-  // SDPA T queries × Tk keys (causal)
+  // SDPA T queries × Tk keys (causal). Tk_dispatched = Tk_valid for the
+  // dynamic path; the replay path (R5) will pass a larger Tk.
+  const Tk_valid = Tk;
   const scoresT = allocTensor(device, model, [T, n_head, Tk], "sdpa_scores_batch");
   {
     const pipeline = await getPipeline(device, model, "sdpa_scores");
     const u = _writeUniforms(device, model,
-      [n_head, n_kv, head_dim, Tk, T, T0],
+      [n_head, n_kv, head_dim, Tk, T, T0, /*scale*/ 0, Tk_valid],
       [[24, 1.0 / Math.sqrt(head_dim)]]);
     _dispatch(device, model, pipeline,
       [qS.buffer, cache.kBuffers[layerIdx], scoresT.buffer],
@@ -1288,7 +1290,7 @@ export async function attentionBlockBatchT(device, model, layerIdx, x, T, T0, ve
   const attnT = allocTensor(device, model, [T, n_head * head_dim], "sdpa_out_batch");
   {
     const pipeline = await getPipeline(device, model, "sdpa_output");
-    const u = _writeUniforms(device, model, [n_head, n_kv, head_dim, Tk, T]);
+    const u = _writeUniforms(device, model, [n_head, n_kv, head_dim, Tk, T, Tk_valid]);
     _dispatch(device, model, pipeline,
       [attnW.buffer, cache.vBuffers[layerIdx], attnT.buffer],
       u, [Math.ceil(T * n_head / 8), Math.ceil(head_dim / 8)]);
@@ -1440,16 +1442,15 @@ export async function attentionBlockT(device, model, layerIdx, x, T0 = 0, ve = n
     _copyBuffer(device, model, v.buffer,  0, cache.vBuffers[layerIdx], writeOffset, kvDim * 4);
     const Tk = cache.seqlens + 1;
 
-    // T=1 decode: T0 = cache.seqlens (= the query's absolute position),
-    //             Tk = T0 + 1, T = 1. All Tk slots are valid (no causal
-    //             mask kicks in because tk <= T0+0 = T0 = Tk-1 always).
+    // T=1 decode. Tk_dispatched = Tk_valid (no replay yet — that's R5).
     const T = 1;
     const T0 = cache.seqlens;
+    const Tk_valid = Tk;
     const scoresT = allocTensor(device, model, [T, n_head, Tk], "sdpa_scores");
     {
       const pipeline = await getPipeline(device, model, "sdpa_scores");
       const u = _writeUniforms(device, model,
-        [n_head, n_kv, head_dim, Tk, T, T0],
+        [n_head, n_kv, head_dim, Tk, T, T0, /*scale*/ 0, Tk_valid],
         [[24, 1.0 / Math.sqrt(head_dim)]]);
       _dispatch(device, model, pipeline,
         [qS.buffer, cache.kBuffers[layerIdx], scoresT.buffer],
@@ -1461,7 +1462,7 @@ export async function attentionBlockT(device, model, layerIdx, x, T0 = 0, ve = n
     attnT = allocTensor(device, model, [T, n_head * head_dim], "sdpa_out");
     {
       const pipeline = await getPipeline(device, model, "sdpa_output");
-      const u = _writeUniforms(device, model, [n_head, n_kv, head_dim, Tk, T]);
+      const u = _writeUniforms(device, model, [n_head, n_kv, head_dim, Tk, T, Tk_valid]);
       _dispatch(device, model, pipeline,
         [attnW.buffer, cache.vBuffers[layerIdx], attnT.buffer],
         u, [Math.ceil(T * n_head / 8), Math.ceil(head_dim / 8)]);
